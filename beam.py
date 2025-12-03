@@ -6,6 +6,9 @@ from collections import deque
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+import os
+import datetime
 
 app = FastAPI()
 
@@ -16,6 +19,8 @@ mode = "air"
 thresholds = {"air": 6, "wall": 10}
 history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
+last_photo_path = None
+last_detected = False
 
 
 def read_rssi_wdutil():
@@ -124,6 +129,9 @@ def start_sampler():
     thread.start()
 
 
+app.mount("/photos", StaticFiles(directory="photos"), name="photos")
+
+
 @app.post("/calibrate")
 def calibrate():
     global baseline
@@ -160,11 +168,16 @@ def set_mode(new_mode: str):
 
 
 def build_metrics_payload():
-    global latest_rssi, baseline, threshold, mode, thresholds, history
+    global latest_rssi, baseline, threshold, mode, thresholds, history, last_photo_path
 
     detected = False
     if latest_rssi is not None and baseline is not None:
         detected = (latest_rssi <= baseline - threshold)
+
+    photo_url = None
+    if last_photo_path:
+        # Serve via /photos/<filename>
+        photo_url = f"/photos/{os.path.basename(last_photo_path)}"
 
     return {
         "rssi": latest_rssi,
@@ -172,6 +185,7 @@ def build_metrics_payload():
         "mode": mode,
         "threshold": threshold,
         "detected": detected,
+        "photo_url": photo_url,
         "history": [
             {"t": int(ts * 1000), "rssi": val}
             for ts, val in history
@@ -569,6 +583,21 @@ function handleMetricsData(data) {
     chartPoints = data.history || [];
     lastBaseline = data.baseline;
     renderChart(chartPoints, lastBaseline);
+
+    const photoBox = document.getElementById("photoBox");
+    if (photoBox) {
+        const url = data.photo_url;
+        if (url) {
+            // Replace current image with latest photo
+            photoBox.innerHTML = "";
+            const img = document.createElement("img");
+            img.src = url + `?t=${Date.now()}`; // cache-bust so latest photo loads
+            img.onload = () => {
+                img.style.opacity = "1";
+            };
+            photoBox.appendChild(img);
+        }
+    }
 
     const status = document.getElementById("status");
     if (data.detected) {
