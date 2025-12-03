@@ -6,6 +6,17 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 
+# Optional microphone support (sounddevice + numpy)
+try:
+    import numpy as np
+    import sounddevice as sd
+
+    MIC_AVAILABLE = True
+    MIC_ERROR = None
+except Exception as exc:
+    MIC_AVAILABLE = False
+    MIC_ERROR = str(exc)
+
 app = FastAPI()
 
 latest_rssi = None
@@ -13,6 +24,13 @@ baseline = None
 threshold = 6   # dB drop = HUMAN detected
 history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
+
+# Microphone levels (dBFS-ish), tracked separately from RSSI
+latest_mic_level = None
+mic_baseline = None
+mic_threshold = 6  # dB increase = HUMAN detected
+mic_history = deque(maxlen=600)
+MIC_BASELINE_PATH = Path("mic_baseline.txt")
 
 def read_rssi_wdutil():
     """
@@ -50,6 +68,31 @@ def read_rssi_wdutil():
     return rssi, noise
 
 
+def read_mic_level(duration: float = 0.25, samplerate: int = 16000):
+    """
+    Sample the default microphone and return RMS level in dBFS-ish.
+    Returns None if microphone support is unavailable or sampling fails.
+    """
+    if not MIC_AVAILABLE:
+        return None
+
+    try:
+        frames = max(1, int(duration * samplerate))
+        audio = sd.rec(frames, samplerate=samplerate, channels=1, dtype="float32")
+        sd.wait()
+        if audio is None:
+            return None
+        rms = float(np.sqrt(np.mean(np.square(audio))))
+        if rms <= 0:
+            return -120.0
+        return round(20 * np.log10(rms), 1)
+    except Exception as exc:
+        global MIC_ERROR
+        MIC_ERROR = str(exc)
+        print(f"WARNING: mic sample failed: {exc}")
+        return None
+
+
 def load_baseline():
     """Load baseline RSSI from disk if available."""
     global baseline
@@ -70,6 +113,26 @@ def persist_baseline(value: int):
         print(f"WARNING: failed to persist baseline: {exc}")
 
 
+def load_mic_baseline():
+    """Load baseline microphone level if available."""
+    global mic_baseline
+    if not MIC_BASELINE_PATH.exists():
+        return
+    try:
+        mic_baseline = float(MIC_BASELINE_PATH.read_text().strip())
+    except Exception as exc:
+        print(f"WARNING: failed to load mic baseline: {exc}")
+        mic_baseline = None
+
+
+def persist_mic_baseline(value: float):
+    """Persist microphone baseline level to disk."""
+    try:
+        MIC_BASELINE_PATH.write_text(str(value))
+    except Exception as exc:
+        print(f"WARNING: failed to persist mic baseline: {exc}")
+
+
 def sampler_loop():
     global latest_rssi, history
     while True:
@@ -86,38 +149,89 @@ def sampler_loop():
         time.sleep(1)
 
 
+def mic_sampler_loop():
+    global latest_mic_level, mic_history
+    while True:
+        if not MIC_AVAILABLE:
+            time.sleep(1)
+            continue
+        try:
+            level = read_mic_level()
+            latest_mic_level = level
+            if level is not None:
+                mic_history.append((time.time(), level))
+        except Exception as exc:
+            print(f"ERROR: mic sampler loop failed: {exc}")
+        time.sleep(1)
+
+
 @app.on_event("startup")
 def start_sampler():
     load_baseline()
+    load_mic_baseline()
     thread = threading.Thread(target=sampler_loop, daemon=True)
     thread.start()
+    if MIC_AVAILABLE:
+        mic_thread = threading.Thread(target=mic_sampler_loop, daemon=True)
+        mic_thread.start()
+    else:
+        print("INFO: microphone sampling disabled - sounddevice/numpy not available")
 
 
 @app.post("/calibrate")
 def calibrate():
-    global baseline
+    global baseline, mic_baseline
+    resp = {}
+
     if latest_rssi is None:
-        return {"error": "No RSSI yet"}
-    baseline = latest_rssi
-    persist_baseline(baseline)
-    return {"baseline": baseline}
+        resp["error"] = "No RSSI yet"
+    else:
+        baseline = latest_rssi
+        persist_baseline(baseline)
+        resp["baseline"] = baseline
+
+    if MIC_AVAILABLE and latest_mic_level is not None:
+        mic_baseline = latest_mic_level
+        persist_mic_baseline(mic_baseline)
+        resp["mic_baseline"] = mic_baseline
+    elif MIC_AVAILABLE:
+        resp["mic_error"] = "Microphone not ready yet"
+
+    return resp
 
 
 @app.get("/metrics")
 def metrics():
-    global latest_rssi, baseline, threshold
+    global latest_rssi, baseline, threshold, latest_mic_level, mic_baseline, mic_threshold
 
-    detected = False
+    rssi_detected = False
+    mic_detected = False
+
     if latest_rssi is not None and baseline is not None:
-        detected = (latest_rssi <= baseline - threshold)
+        rssi_detected = bool(latest_rssi <= baseline - threshold)
+
+    if MIC_AVAILABLE and latest_mic_level is not None and mic_baseline is not None:
+        mic_detected = bool(latest_mic_level >= mic_baseline + mic_threshold)
 
     return {
         "rssi": latest_rssi,
         "baseline": baseline,
-        "detected": detected,
+        "threshold": threshold,
+        "rssi_detected": rssi_detected,
+        "mic_level": latest_mic_level,
+        "mic_baseline": mic_baseline,
+        "mic_threshold": mic_threshold,
+        "mic_detected": mic_detected,
+        "mic_available": MIC_AVAILABLE,
+        "mic_error": MIC_ERROR if not MIC_AVAILABLE else None,
+        "detected": rssi_detected or mic_detected,
         "history": [
             {"t": int(ts * 1000), "rssi": val}
             for ts, val in history
+        ],
+        "mic_history": [
+            {"t": int(ts * 1000), "level": val}
+            for ts, val in mic_history
         ],
     }
 
@@ -254,16 +368,17 @@ button:active { transform: translateY(0); box-shadow: none; }
 .chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
 .dot.base { background: var(--accent-2); }
-#chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
+#chart, #mic-chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
 </style>
 </head>
 <body>
 
 <div class="frame">
   <h1>Wi‑Fi Presence <span>Live</span></h1>
-  <div class="sub">Monitors RSSI drops against a calibrated baseline. Run calibration when no one is in the path.</div>
+  <div class="sub">Dual-sensor monitoring: Wi‑Fi RSSI drops and microphone spikes compared to calibrated baselines.</div>
 
   <div id="status" class="badge ok">Waiting for signal...</div>
+  <div id="reason" class="muted">Calibrate while the path is empty and the room is quiet.</div>
 
   <div class="grid">
     <div class="card">
@@ -277,21 +392,31 @@ button:active { transform: translateY(0); box-shadow: none; }
       <div class="muted">Persisted across restarts</div>
     </div>
     <div class="card">
-      <div class="label">Threshold</div>
+      <div class="label">Wi‑Fi Threshold</div>
       <div class="value"><span id="threshold">6</span> dB</div>
       <div class="muted">Drop relative to baseline</div>
+    </div>
+    <div class="card">
+      <div class="label">Mic Level</div>
+      <div class="value"><span id="mic-level">?</span> dBFS</div>
+      <div class="muted" id="mic-state">Sampling ambient audio</div>
+    </div>
+    <div class="card">
+      <div class="label">Mic Baseline</div>
+      <div class="value"><span id="mic-baseline">?</span> dBFS</div>
+      <div class="muted">Spike threshold: <span id="mic-threshold">6</span> dB</div>
     </div>
   </div>
 
   <div class="actions">
-    <button onclick="doCalibrate()">Calibrate (no human present)</button>
+    <button onclick="doCalibrate()">Calibrate (clear path & quiet)</button>
     <div class="toggles">
       <button class="chip active" data-rate="300" onclick="setRate(this)">300 ms</button>
       <button class="chip" data-rate="500" onclick="setRate(this)">500 ms</button>
       <button class="chip" data-rate="1000" onclick="setRate(this)">1 s</button>
       <button class="chip" data-rate="2000" onclick="setRate(this)">2 s</button>
     </div>
-    <div class="muted">Refresh rate: <span id="rate-label">300 ms</span></div>
+    <div class="muted">Refresh rate: <span id="rate-label">300 ms</span> • Detection via Wi‑Fi drop OR mic spike</div>
   </div>
 
   <div class="chart-card">
@@ -307,45 +432,80 @@ button:active { transform: translateY(0); box-shadow: none; }
     </div>
     <canvas id="chart"></canvas>
   </div>
+
+  <div class="chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="title">Mic Level Over Time</div>
+        <div class="subtle">Short RMS snapshots from the default microphone</div>
+      </div>
+      <div class="chart-legend">
+        <span><span class="dot live" style="background:#a855f7; box-shadow: 0 0 12px rgba(168,85,247,0.7);"></span>Mic level</span>
+        <span><span class="dot base"></span>Baseline</span>
+      </div>
+    </div>
+    <canvas id="mic-chart"></canvas>
+  </div>
 </div>
 
 <script>
 let threshold = 6;
+let micThreshold = 6;
 let pollMs = 300;
 let pollHandle = null;
 let chartPoints = [];
+let micChartPoints = [];
 let lastBaseline = null;
+let lastMicBaseline = null;
 
-const canvas = document.getElementById("chart");
-const ctx = canvas.getContext("2d");
+const wifiCanvas = document.getElementById("chart");
+const micCanvas = document.getElementById("mic-chart");
+const wifiCtx = wifiCanvas.getContext("2d");
+const micCtx = micCanvas.getContext("2d");
 const dpr = window.devicePixelRatio || 1;
-let chartSize = {width: 0, height: 0};
+let wifiSize = {width: 0, height: 0};
+let micSize = {width: 0, height: 0};
 
-function resizeCanvas() {
+const wifiPalette = {
+    line: '#22d3ee',
+    fillTop: 'rgba(34,211,238,0.3)',
+    fillBottom: 'rgba(34,211,238,0.02)',
+    baseline: '#f59e0b',
+};
+
+const micPalette = {
+    line: '#a855f7',
+    fillTop: 'rgba(168,85,247,0.28)',
+    fillBottom: 'rgba(168,85,247,0.02)',
+    baseline: '#f59e0b',
+};
+
+function ensureCanvasSize(canvas, ctx, size) {
     const rect = canvas.getBoundingClientRect();
-    chartSize = {width: rect.width, height: rect.height};
+    size.width = rect.width;
+    size.height = rect.height;
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 }
 
-function renderChart(points, baseline) {
+function renderSeries(canvas, ctx, size, points, baseline, valueKey, palette, emptyLabel) {
     if (!canvas) return;
-    if (!chartSize.width || !chartSize.height) {
-        resizeCanvas();
+    if (!size.width || !size.height) {
+        ensureCanvasSize(canvas, ctx, size);
     }
 
-    ctx.clearRect(0, 0, chartSize.width, chartSize.height);
+    ctx.clearRect(0, 0, size.width, size.height);
 
     if (!points || !points.length) {
         ctx.fillStyle = 'rgba(229,231,235,0.6)';
         ctx.font = '14px Space Grotesk, sans-serif';
-        ctx.fillText('Waiting for samples…', 16, chartSize.height / 2);
+        ctx.fillText(emptyLabel, 16, size.height / 2);
         return;
     }
 
     const xs = points.map(p => p.t);
-    const ys = points.map(p => p.rssi);
+    const ys = points.map(p => p[valueKey]);
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
     const minY = Math.min(...ys, baseline ?? ys[0]);
@@ -356,18 +516,18 @@ function renderChart(points, baseline) {
 
     const x = t => {
         const n = (t - minX) / spanX;
-        return margin + n * (chartSize.width - margin * 2);
+        return margin + n * (size.width - margin * 2);
     };
 
     const y = v => {
         const n = (v - minY) / spanY;
-        return chartSize.height - margin - n * (chartSize.height - margin * 2);
+        return size.height - margin - n * (size.height - margin * 2);
     };
 
     if (baseline !== null && baseline !== undefined) {
         ctx.save();
         ctx.setLineDash([6, 6]);
-        ctx.strokeStyle = '#f59e0b';
+        ctx.strokeStyle = palette.baseline;
         ctx.lineWidth = 1.2;
         ctx.beginPath();
         ctx.moveTo(x(minX), y(baseline));
@@ -377,35 +537,35 @@ function renderChart(points, baseline) {
     }
 
     ctx.beginPath();
-    ctx.moveTo(x(points[0].t), y(points[0].rssi));
+    ctx.moveTo(x(points[0].t), y(points[0][valueKey]));
     for (let i = 1; i < points.length; i++) {
-        ctx.lineTo(x(points[i].t), y(points[i].rssi));
+        ctx.lineTo(x(points[i].t), y(points[i][valueKey]));
     }
-    ctx.lineTo(x(points[points.length - 1].t), chartSize.height - margin);
-    ctx.lineTo(x(points[0].t), chartSize.height - margin);
+    ctx.lineTo(x(points[points.length - 1].t), size.height - margin);
+    ctx.lineTo(x(points[0].t), size.height - margin);
     ctx.closePath();
 
-    const gradient = ctx.createLinearGradient(0, margin, 0, chartSize.height - margin);
-    gradient.addColorStop(0, 'rgba(34,211,238,0.3)');
-    gradient.addColorStop(1, 'rgba(34,211,238,0.02)');
+    const gradient = ctx.createLinearGradient(0, margin, 0, size.height - margin);
+    gradient.addColorStop(0, palette.fillTop);
+    gradient.addColorStop(1, palette.fillBottom);
     ctx.fillStyle = gradient;
     ctx.fill();
 
     ctx.beginPath();
-    ctx.moveTo(x(points[0].t), y(points[0].rssi));
+    ctx.moveTo(x(points[0].t), y(points[0][valueKey]));
     for (let i = 1; i < points.length; i++) {
-        ctx.lineTo(x(points[i].t), y(points[i].rssi));
+        ctx.lineTo(x(points[i].t), y(points[i][valueKey]));
     }
-    ctx.strokeStyle = '#22d3ee';
+    ctx.strokeStyle = palette.line;
     ctx.lineWidth = 2;
     ctx.stroke();
 
     const lastPoint = points[points.length - 1];
-    ctx.fillStyle = '#22d3ee';
+    ctx.fillStyle = palette.line;
     ctx.strokeStyle = '#0f172a';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.arc(x(lastPoint.t), y(lastPoint.rssi), 5, 0, Math.PI * 2);
+    ctx.arc(x(lastPoint.t), y(lastPoint[valueKey]), 5, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 }
@@ -415,30 +575,67 @@ async function update() {
         const res = await fetch("/metrics");
         const data = await res.json();
 
+        threshold = data.threshold ?? threshold;
+        micThreshold = data.mic_threshold ?? micThreshold;
+
+        const fmtNum = (val, digits = 1) => {
+            if (val === null || val === undefined) return "?";
+            return typeof val === "number" ? val.toFixed(digits) : val;
+        };
+
         document.getElementById("rssi").textContent = data.rssi ?? "?";
         document.getElementById("baseline").textContent =
             data.baseline === null ? "?" : data.baseline;
         document.getElementById("threshold").textContent = threshold;
+        document.getElementById("mic-level").textContent = fmtNum(data.mic_level);
+        document.getElementById("mic-baseline").textContent =
+            data.mic_baseline === null || data.mic_baseline === undefined ? "?" : data.mic_baseline.toFixed(1);
+        document.getElementById("mic-threshold").textContent = micThreshold;
+
+        const micState = document.getElementById("mic-state");
+        if (!data.mic_available) {
+            micState.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
+        } else if (data.mic_level === null || data.mic_level === undefined) {
+            micState.textContent = "Waiting for mic samples…";
+        } else {
+            micState.textContent = "Ambient level vs baseline";
+        }
+
         chartPoints = data.history || [];
+        micChartPoints = data.mic_history || [];
         lastBaseline = data.baseline;
-        renderChart(chartPoints, lastBaseline);
+        lastMicBaseline = data.mic_baseline;
+        renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
+        renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, data.mic_available ? "Waiting for mic samples…" : "Mic unavailable");
 
         const status = document.getElementById("status");
+        const reason = document.getElementById("reason");
+        const reasons = [];
+        if (data.rssi_detected) reasons.push("Wi‑Fi drop");
+        if (data.mic_detected) reasons.push("Mic spike");
 
         if (data.detected) {
             status.textContent = "Presence detected";
             status.className = "badge alert";
+            reason.textContent = reasons.length ? `Trigger: ${reasons.join(" + ")}` : "Threshold exceeded";
         } else if (data.rssi === null) {
             status.textContent = "Waiting for RSSI...";
             status.className = "badge ok";
+            reason.textContent = "Sampler is warming up.";
         } else {
             status.textContent = "Path is clear";
             status.className = "badge ok";
+            if (!data.mic_available) {
+                reason.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
+            } else {
+                reason.textContent = "Watching Wi‑Fi drops and mic spikes vs baselines.";
+            }
         }
     } catch (e) {
         const status = document.getElementById("status");
         status.textContent = "Connection lost";
         status.className = "badge alert";
+        document.getElementById("reason").textContent = "The UI cannot reach /metrics right now.";
     }
 }
 
@@ -460,12 +657,18 @@ async function doCalibrate() {
     await update();
 }
 
+function resizeAll() {
+    ensureCanvasSize(wifiCanvas, wifiCtx, wifiSize);
+    ensureCanvasSize(micCanvas, micCtx, micSize);
+}
+
 update();
-resizeCanvas();
+resizeAll();
 pollHandle = setInterval(update, pollMs);
 window.addEventListener('resize', () => {
-    resizeCanvas();
-    renderChart(chartPoints, lastBaseline);
+    resizeAll();
+    renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
+    renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, "Waiting for mic samples…");
 });
 </script>
 
