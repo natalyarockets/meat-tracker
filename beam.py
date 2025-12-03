@@ -42,6 +42,16 @@ mic_threshold = 6  # dB increase = HUMAN detected
 mic_history = deque(maxlen=600)
 MIC_BASELINE_PATH = Path("mic_baseline.txt")
 
+# Doppler-style motion score around a high-frequency carrier
+DOPPLER_CARRIER_HZ = 19000
+DOPPLER_BAND_HZ = 400
+DOPPLER_SCORE_THRESHOLD = 0.02
+DOPPLER_SAMPLERATE = 48000
+DOPPLER_FRAMES = 2048
+doppler_score = None
+doppler_history = deque(maxlen=600)
+_doppler_prev_band = None
+
 
 def read_rssi_wdutil():
     try:
@@ -176,16 +186,41 @@ def sampler_loop():
 
 
 def mic_sampler_loop():
-    global latest_mic_level, mic_history
+    global latest_mic_level, mic_history, doppler_score, doppler_history, _doppler_prev_band
     while True:
         if not MIC_AVAILABLE:
             time.sleep(1)
             continue
         try:
-            level = read_mic_level()
-            latest_mic_level = level
-            if level is not None:
-                mic_history.append((time.time(), level))
+            frames = max(1, DOPPLER_FRAMES)
+            audio = sd.rec(
+                frames,
+                samplerate=DOPPLER_SAMPLERATE,
+                channels=1,
+                dtype="float32",
+            )
+            sd.wait()
+            if audio is None:
+                latest_mic_level = None
+            else:
+                audio = audio.flatten()
+                rms = float(np.sqrt(np.mean(np.square(audio))))
+                latest_mic_level = round(20 * np.log10(rms), 1) if rms > 0 else -120.0
+                mic_history.append((time.time(), latest_mic_level))
+
+                # Doppler-style motion metric: spectral change near carrier
+                spectrum = np.abs(np.fft.rfft(audio))
+                freqs = np.fft.rfftfreq(len(audio), 1 / DOPPLER_SAMPLERATE)
+                band_mask = (freqs >= DOPPLER_CARRIER_HZ - DOPPLER_BAND_HZ) & (
+                    freqs <= DOPPLER_CARRIER_HZ + DOPPLER_BAND_HZ
+                )
+                band = spectrum[band_mask]
+                if band.size:
+                    if _doppler_prev_band is not None and _doppler_prev_band.size == band.size:
+                        diff = np.mean(np.abs(band - _doppler_prev_band))
+                        doppler_score = round(float(diff), 4)
+                        doppler_history.append((time.time(), doppler_score))
+                    _doppler_prev_band = band
         except Exception as exc:
             print(f"ERROR: mic sampler loop failed: {exc}")
         time.sleep(1)
@@ -295,6 +330,12 @@ def build_metrics_payload():
         "mic_history": [
             {"t": int(ts * 1000), "level": val}
             for ts, val in mic_history
+        ],
+        "doppler_score": doppler_score,
+        "doppler_detected": bool(doppler_score is not None and doppler_score >= DOPPLER_SCORE_THRESHOLD),
+        "doppler_history": [
+            {"t": int(ts * 1000), "score": val}
+            for ts, val in doppler_history
         ],
         "last_photo": last_photo_path,
     }
@@ -517,6 +558,11 @@ button:active { transform: translateY(0); box-shadow: none; }
       <div class="value"><span id="mic-baseline">?</span> dBFS</div>
       <div class="muted">Spike threshold: <span id="mic-threshold">6</span> dB</div>
     </div>
+    <div class="card">
+      <div class="label">Doppler Score</div>
+      <div class="value"><span id="doppler-score">?</span></div>
+      <div class="muted">Spectral change near 19 kHz</div>
+    </div>
   </div>
 
   <div class="actions">
@@ -577,6 +623,7 @@ let chartPoints = [];
 let micChartPoints = [];
 let lastBaseline = null;
 let lastMicBaseline = null;
+let dopplerScore = null;
 let socket = null;
 
 const wifiCanvas = document.getElementById("chart");
@@ -726,6 +773,9 @@ function handleMetricsData(data) {
     document.getElementById("mic-baseline").textContent =
         data.mic_baseline === null || data.mic_baseline === undefined ? "?" : data.mic_baseline.toFixed(1);
     document.getElementById("mic-threshold").textContent = micThreshold;
+    dopplerScore = data.doppler_score ?? dopplerScore;
+    document.getElementById("doppler-score").textContent =
+        dopplerScore === null || dopplerScore === undefined ? "?" : dopplerScore.toFixed(3);
 
     const micState = document.getElementById("mic-state");
     if (!data.mic_available) {
@@ -760,6 +810,7 @@ function handleMetricsData(data) {
     const reasons = [];
     if (data.rssi_detected) reasons.push("Wi‑Fi drop");
     if (data.mic_detected) reasons.push("Mic spike");
+    if (data.doppler_detected) reasons.push("Doppler motion");
 
     if (data.detected) {
         status.textContent = "Presence detected";
