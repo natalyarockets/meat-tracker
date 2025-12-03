@@ -77,7 +77,7 @@ def take_photo():
     filename = f"photos/capture_{ts}.jpg"
 
     try:
-        subprocess.run(["imagesnap", "-w", "0.1", filename], check=True)
+        subprocess.run(["imagesnap", "-w", "0.8", filename], check=True)
         last_photo_path = filename
     except Exception as exc:
         print(f"ERROR capturing photo: {exc}")
