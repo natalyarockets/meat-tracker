@@ -1,0 +1,266 @@
+import * as THREE from 'three';
+import { Scene3D } from './Scene3D';
+import { StatusPanel } from '../panels/StatusPanel';
+import { ControlPanel } from '../panels/ControlPanel';
+import { DetectionState, MarkerType, MarkerPosition } from '@/types/detection';
+import { Wifi } from 'lucide-react';
+
+// ============================================
+// CONFIGURATION - Update this to your backend
+// ============================================
+const API_BASE_URL = 'http://localhost:8000'; // Your beam.py FastAPI server
+const POLL_INTERVAL = 300; // Poll every 300ms (matches your frontend)
+
+// ElevenLabs config (optional - for voice alerts)
+const ELEVENLABS_API_KEY = 'sk_b1c748d1b35c4e30d1a0eadedeed65e4c490ffd0a4e5ec96';
+const VOICE_ID = '21m00Tcm4TlvDq8ikWAM';
+const VOICE_ENABLED = true; // Set to false to disable voice
+
+export const RoomViewer = () => {
+  const [modelUrl, setModelUrl] = useState<string | null>(null);
+  const [placingMarker, setPlacingMarker] = useState<MarkerType>(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const lastDetectionState = useRef<boolean>(false);
+  const isSpeaking = useRef<boolean>(false);
+
+  const [state, setState] = useState<DetectionState>({
+    isDetected: false,
+    rssi: -45,
+    baseline: -42,
+    phonePosition: null,
+    laptopPosition: null,
+  });
+
+  // Voice announcement function
+  const speak = useCallback(async (text: string) => {
+    if (!VOICE_ENABLED || isSpeaking.current) return;
+    
+    isSpeaking.current = true;
+    console.log('🔊 Speaking:', text);
+
+    try {
+      const response = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${VOICE_ID}`, {
+        method: 'POST',
+        headers: {
+          'Accept': 'audio/mpeg',
+          'Content-Type': 'application/json',
+          'xi-api-key': ELEVENLABS_API_KEY,
+        },
+        body: JSON.stringify({
+          text,
+          model_id: 'eleven_monolingual_v1',
+          voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+        }),
+      });
+
+      if (response.ok) {
+        const audioBlob = await response.blob();
+        const audioUrl = URL.createObjectURL(audioBlob);
+        const audio = new Audio(audioUrl);
+        audio.onended = () => {
+          isSpeaking.current = false;
+          URL.revokeObjectURL(audioUrl);
+        };
+        audio.onerror = () => {
+          isSpeaking.current = false;
+        };
+        await audio.play();
+      } else {
+        isSpeaking.current = false;
+      }
+    } catch (error) {
+      console.error('Speech error:', error);
+      isSpeaking.current = false;
+    }
+  }, []);
+
+  // Poll the backend for real-time metrics
+  useEffect(() => {
+    const fetchMetrics = async () => {
+      try {
+        const response = await fetch(`${API_BASE_URL}/metrics`);
+        if (!response.ok) throw new Error('Failed to fetch');
+        
+        const data = await response.json();
+        setIsConnected(true);
+        setConnectionError(null);
+
+        setState(prev => ({
+          ...prev,
+          rssi: data.rssi ?? prev.rssi,
+          baseline: data.baseline ?? prev.baseline,
+          isDetected: data.detected ?? false,
+        }));
+
+        // Voice alert on state change
+        if (data.detected !== lastDetectionState.current) {
+          if (data.detected) {
+            speak('Object detected');
+          } else if (lastDetectionState.current === true) {
+            speak('Clear');
+          }
+          lastDetectionState.current = data.detected;
+        }
+
+      } catch (error) {
+        setIsConnected(false);
+        setConnectionError('Cannot connect to backend. Is beam.py running?');
+      }
+    };
+
+    // Initial fetch
+    fetchMetrics();
+
+    // Poll at interval
+    const interval = setInterval(fetchMetrics, POLL_INTERVAL);
+    return () => clearInterval(interval);
+  }, [speak]);
+
+  // Calibrate the baseline
+  const handleCalibrate = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/calibrate`, { method: 'POST' });
+      if (response.ok) {
+        const data = await response.json();
+        setState(prev => ({ ...prev, baseline: data.baseline }));
+        speak('Calibration complete');
+      }
+    } catch (error) {
+      console.error('Calibration failed:', error);
+    }
+  }, [speak]);
+
+  const handleFileUpload = useCallback((file: File) => {
+    const url = URL.createObjectURL(file);
+    setModelUrl(url);
+  }, []);
+
+  const handlePlaceMarker = useCallback((position: THREE.Vector3) => {
+    if (!placingMarker) return;
+
+    const markerPos: MarkerPosition = {
+      x: position.x,
+      y: position.y + 0.1,
+      z: position.z,
+    };
+
+    setState(prev => ({
+      ...prev,
+      [placingMarker === 'phone' ? 'phonePosition' : 'laptopPosition']: markerPos,
+    }));
+
+    setPlacingMarker(null);
+  }, [placingMarker]);
+
+  const handleToggleDetection = useCallback(() => {
+    // For demo/testing when backend not connected
+    setState(prev => ({
+      ...prev,
+      isDetected: !prev.isDetected,
+    }));
+  }, []);
+
+  const handleReset = useCallback(() => {
+    setModelUrl(null);
+    setPlacingMarker(null);
+    setState({
+      isDetected: false,
+      rssi: -45,
+      baseline: -42,
+      phonePosition: null,
+      laptopPosition: null,
+    });
+  }, []);
+
+  return (
+    <div className="min-h-screen bg-background p-4 md:p-6">
+      {/* Header */}
+      <header className="mb-6">
+        <div className="flex items-center gap-3 mb-2">
+          <div className="p-2 rounded-lg bg-primary/10 glow-primary">
+            <Wifi className="w-6 h-6 text-primary" />
+          </div>
+          <div>
+            <h1 className="text-xl md:text-2xl font-bold text-gradient">
+              WiFi RSSI Detection Viewer
+            </h1>
+            <p className="text-sm text-muted-foreground font-mono">
+              Human presence detection via signal analysis
+            </p>
+          </div>
+          {/* Connection status */}
+          <div className="ml-auto flex items-center gap-2">
+            <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'} animate-pulse`} />
+            <span className="text-xs font-mono text-muted-foreground">
+              {isConnected ? 'Live' : 'Offline'}
+            </span>
+          </div>
+        </div>
+        {connectionError && (
+          <div className="mt-2 p-2 bg-destructive/20 rounded text-sm text-destructive font-mono">
+            {connectionError}
+          </div>
+        )}
+      </header>
+
+      {/* Main content */}
+      <div className="grid grid-cols-1 lg:grid-cols-[1fr_320px] gap-4 md:gap-6">
+        {/* 3D Viewer */}
+        <div className="order-2 lg:order-1">
+          <div className="glass-panel p-2 h-[400px] md:h-[600px]">
+            <Scene3D
+              modelUrl={modelUrl}
+              phonePosition={state.phonePosition}
+              laptopPosition={state.laptopPosition}
+              isDetected={state.isDetected}
+              placingMarker={placingMarker}
+              onPlaceMarker={handlePlaceMarker}
+            />
+          </div>
+          
+          {/* Instructions */}
+          <div className="mt-4 glass-panel p-4">
+            <h3 className="text-sm font-mono font-semibold text-muted-foreground mb-2">
+              Instructions
+            </h3>
+            <ul className="text-sm text-muted-foreground space-y-1">
+              <li>• Start your backend: <code className="bg-secondary px-1 rounded">uvicorn beam:app --reload</code></li>
+              <li>• Drag to rotate the view, scroll to zoom</li>
+              <li>• Upload your .glb room scan</li>
+              <li>• Place Phone (transmitter) and Laptop (receiver) markers</li>
+              <li>• Click "Calibrate" when area is clear</li>
+              <li>• Walk between devices to trigger detection!</li>
+            </ul>
+          </div>
+        </div>
+
+        {/* Panels */}
+        <div className="order-1 lg:order-2 space-y-4">
+          <StatusPanel state={state} />
+          
+          {/* Calibrate button */}
+          <button
+            onClick={handleCalibrate}
+            disabled={!isConnected}
+            className="w-full p-3 bg-primary/20 hover:bg-primary/30 disabled:opacity-50 disabled:cursor-not-allowed rounded-lg font-mono text-sm transition-colors"
+          >
+            📡 Calibrate Baseline
+          </button>
+          
+          <ControlPanel
+            modelUrl={modelUrl}
+            phonePosition={state.phonePosition}
+            laptopPosition={state.laptopPosition}
+            placingMarker={placingMarker}
+            isDetected={state.isDetected}
+            onFileUpload={handleFileUpload}
+            onPlacingMarkerChange={setPlacingMarker}
+            onToggleDetection={handleToggleDetection}
+            onReset={handleReset}
+          />
+        </div>
+      </div>
+    </div>
+  );
+};

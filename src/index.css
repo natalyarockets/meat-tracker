@@ -1,0 +1,197 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 220 20% 6%;
+    --foreground: 200 20% 95%;
+
+    --card: 220 18% 10%;
+    --card-foreground: 200 20% 95%;
+
+    --popover: 220 18% 10%;
+    --popover-foreground: 200 20% 95%;
+
+    --primary: 190 100% 50%;
+    --primary-foreground: 220 20% 6%;
+
+    --secondary: 220 15% 18%;
+    --secondary-foreground: 200 20% 95%;
+
+    --muted: 220 15% 15%;
+    --muted-foreground: 200 10% 55%;
+
+    --accent: 160 100% 45%;
+    --accent-foreground: 220 20% 6%;
+
+    --destructive: 0 85% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 15% 20%;
+    --input: 220 15% 20%;
+    --ring: 190 100% 50%;
+
+    --radius: 0.5rem;
+
+    /* Custom colors for the app */
+    --phone-color: 210 100% 60%;
+    --laptop-color: 145 70% 50%;
+    --detection-color: 0 85% 55%;
+    --beam-clear: 190 100% 50%;
+    --beam-detected: 0 85% 55%;
+
+    /* Glow effects */
+    --glow-primary: 0 0 20px hsl(190 100% 50% / 0.5);
+    --glow-detection: 0 0 30px hsl(0 85% 55% / 0.7);
+    --glow-accent: 0 0 20px hsl(160 100% 45% / 0.5);
+
+    --sidebar-background: 220 18% 10%;
+    --sidebar-foreground: 200 20% 95%;
+    --sidebar-primary: 190 100% 50%;
+    --sidebar-primary-foreground: 220 20% 6%;
+    --sidebar-accent: 220 15% 18%;
+    --sidebar-accent-foreground: 200 20% 95%;
+    --sidebar-border: 220 15% 20%;
+    --sidebar-ring: 190 100% 50%;
+  }
+
+  .dark {
+    --background: 220 20% 6%;
+    --foreground: 200 20% 95%;
+
+    --card: 220 18% 10%;
+    --card-foreground: 200 20% 95%;
+
+    --popover: 220 18% 10%;
+    --popover-foreground: 200 20% 95%;
+
+    --primary: 190 100% 50%;
+    --primary-foreground: 220 20% 6%;
+
+    --secondary: 220 15% 18%;
+    --secondary-foreground: 200 20% 95%;
+
+    --muted: 220 15% 15%;
+    --muted-foreground: 200 10% 55%;
+
+    --accent: 160 100% 45%;
+    --accent-foreground: 220 20% 6%;
+
+    --destructive: 0 85% 55%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 220 15% 20%;
+    --input: 220 15% 20%;
+    --ring: 190 100% 50%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+  }
+
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+}
+
+@layer components {
+  .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .glass-panel {
+    @apply bg-card/80 backdrop-blur-md border border-border/50 rounded-lg;
+  }
+
+  .glow-primary {
+    box-shadow: var(--glow-primary);
+  }
+
+  .glow-detection {
+    box-shadow: var(--glow-detection);
+  }
+
+  .glow-accent {
+    box-shadow: var(--glow-accent);
+  }
+
+  .status-indicator {
+    @apply w-3 h-3 rounded-full;
+  }
+
+  .status-clear {
+    @apply bg-accent;
+    box-shadow: 0 0 10px hsl(var(--accent) / 0.7);
+  }
+
+  .status-detected {
+    @apply bg-destructive;
+    box-shadow: 0 0 10px hsl(var(--destructive) / 0.7);
+    animation: pulse-glow 1s ease-in-out infinite;
+  }
+}
+
+@layer utilities {
+  @keyframes pulse-glow {
+    0%, 100% {
+      opacity: 1;
+      box-shadow: 0 0 10px hsl(var(--destructive) / 0.7);
+    }
+    50% {
+      opacity: 0.7;
+      box-shadow: 0 0 25px hsl(var(--destructive) / 0.9);
+    }
+  }
+
+  @keyframes beam-pulse {
+    0%, 100% {
+      opacity: 0.8;
+    }
+    50% {
+      opacity: 0.4;
+    }
+  }
+
+  @keyframes scan-line {
+    0% {
+      transform: translateY(-100%);
+    }
+    100% {
+      transform: translateY(100%);
+    }
+  }
+
+  @keyframes float {
+    0%, 100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-5px);
+    }
+  }
+
+  .animate-pulse-glow {
+    animation: pulse-glow 1s ease-in-out infinite;
+  }
+
+  .animate-beam-pulse {
+    animation: beam-pulse 0.5s ease-in-out infinite;
+  }
+
+  .animate-float {
+    animation: float 3s ease-in-out infinite;
+  }
+
+  .text-gradient {
+    @apply bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent;
+  }
+}
