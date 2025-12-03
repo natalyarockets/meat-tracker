@@ -478,8 +478,9 @@ def index():
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap');
 :root {
-    --bg: #0f172a;
-    --card: #111827;
+    --bg: #0b1220;
+    --card: #0f172a;
+    --card-2: #111827;
     --accent: #22d3ee;
     --accent-2: #f59e0b;
     --text: #e5e7eb;
@@ -489,96 +490,79 @@ def index():
 }
 * { box-sizing: border-box; }
 body {
-    margin: 0; padding: 0;
+    margin: 0;
     font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
-    background: radial-gradient(circle at 20% 20%, #1f2937 0, #0f172a 40%, #0b1224 100%);
+    background: radial-gradient(circle at 20% 20%, #111827 0, #0b1220 40%, #0a0f1b 100%);
     color: var(--text);
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
+    padding: 16px;
 }
 .frame {
-    width: min(900px, 92vw);
-    background: linear-gradient(145deg, rgba(17,24,39,0.9), rgba(24,24,27,0.9));
-    border: 1px solid rgba(255,255,255,0.05);
-    border-radius: 20px;
-    padding: 32px;
-    box-shadow: 0 25px 50px rgba(0,0,0,0.45);
+    width: min(1080px, 100%);
+    background: linear-gradient(135deg, rgba(17,24,39,0.9), rgba(15,19,30,0.95));
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 18px;
+    padding: 20px;
+    box-shadow: 0 18px 50px rgba(0,0,0,0.45);
+}
+.header {
+    display: flex;
+    justify-content: space-between;
+    gap: 16px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+    margin-bottom: 12px;
 }
 h1 {
-    margin: 0 0 12px;
-    font-size: 34px;
+    margin: 0;
+    font-size: 26px;
     letter-spacing: -0.02em;
-    display: flex;
-    gap: 12px;
-    align-items: center;
 }
-h1 span {
-    display: inline-flex;
-    padding: 6px 12px;
-    border-radius: 12px;
-    background: rgba(34,211,238,0.12);
-    border: 1px solid rgba(34,211,238,0.3);
-    color: var(--accent);
-    font-size: 16px;
-}
-.sub {
-    color: var(--muted);
-    margin-bottom: 24px;
-    font-size: 16px;
-}
-.grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 16px;
-}
-.card {
-    background: var(--card);
-    border: 1px solid rgba(255,255,255,0.04);
-    border-radius: 14px;
-    padding: 18px;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-.label { color: var(--muted); font-size: 14px; }
-.value { font-size: 32px; font-weight: 700; letter-spacing: -0.01em; }
+.sub { color: var(--muted); margin-top: 4px; font-size: 14px; }
+.status-group { display: flex; flex-direction: column; gap: 6px; align-items: flex-end; min-width: 200px; }
 .badge {
     display: inline-flex;
     align-items: center;
     gap: 8px;
-    padding: 10px 14px;
-    border-radius: 12px;
+    padding: 8px 12px;
+    border-radius: 999px;
     font-weight: 700;
-    font-size: 18px;
+    font-size: 15px;
     border: 1px solid rgba(255,255,255,0.08);
-    margin-top: 10px;
 }
 .ok { color: var(--ok); background: rgba(16,185,129,0.12); border-color: rgba(16,185,129,0.35); }
 .alert { color: var(--alert); background: rgba(239,68,68,0.12); border-color: rgba(239,68,68,0.35); }
-.actions { margin-top: 22px; display: flex; gap: 12px; flex-wrap: wrap; }
-.toggles { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.muted { color: var(--muted); font-size: 13px; }
+.controls {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 10px;
+    align-items: center;
+    margin-bottom: 14px;
+}
+.controls .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chips { display: flex; gap: 6px; flex-wrap: wrap; }
 button.chip {
     background: rgba(255,255,255,0.06);
     color: var(--text);
     border: 1px solid rgba(255,255,255,0.12);
-    box-shadow: none;
+    padding: 8px 12px;
+    border-radius: 10px;
+    font-size: 14px;
 }
 button.chip.active {
     background: rgba(34,211,238,0.16);
     border-color: rgba(34,211,238,0.45);
     color: var(--accent);
 }
-.mode-toggle-row {
-    display: inline-flex;
-    gap: 6px;
-    margin-left: 6px;
-}
+.mode-toggle-row { display: inline-flex; gap: 6px; }
 button {
     font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
-    font-size: 16px;
-    padding: 12px 18px;
+    font-size: 15px;
+    padding: 11px 14px;
     border-radius: 12px;
     border: none;
     cursor: pointer;
@@ -589,66 +573,107 @@ button {
 }
 button:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgba(34,211,238,0.25); }
 button:active { transform: translateY(0); box-shadow: none; }
-.muted { color: var(--muted); font-size: 14px; margin-top: 6px; }
-
+input#threshold-input {
+    width: 76px;
+    border-radius: 10px;
+    border: 1px solid rgba(255,255,255,0.12);
+    background: rgba(15,23,42,0.9);
+    color: #e5e7eb;
+    padding: 6px 8px;
+}
+.grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+}
+.card {
+    background: var(--card-2);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 12px;
+    padding: 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+.label { color: var(--muted); font-size: 13px; }
+.value { font-size: 26px; font-weight: 700; letter-spacing: -0.01em; }
+.chart-area {
+    margin-top: 16px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 12px;
+}
 .chart-card {
-    margin-top: 24px;
     background: var(--card);
     border: 1px solid rgba(255,255,255,0.05);
-    border-radius: 16px;
-    padding: 16px;
+    border-radius: 14px;
+    padding: 14px;
 }
-.chart-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-.chart-head .title { font-weight: 700; font-size: 18px; }
-.chart-head .subtle { color: var(--muted); font-size: 14px; }
-.chart-legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 14px; }
+.chart-head { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.chart-head .title { font-weight: 700; font-size: 16px; }
+.chart-head .subtle { color: var(--muted); font-size: 13px; }
+.chart-legend { display: flex; gap: 10px; flex-wrap: wrap; color: var(--muted); font-size: 13px; }
 .chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
 .dot.base { background: var(--accent-2); }
 
-#chartContainer { position: relative; z-index: 1; height: 260px; }
+#chartContainer { position: relative; z-index: 1; height: 220px; }
 #chart { width: 100%; height: 100%; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
-#photoContainer { position: relative; z-index: 2; margin-top: 30px; }
-#photoBox { width: 100%; height: 320px; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+#photoBox { width: 100%; height: 240px; display: flex; justify-content: center; align-items: center; overflow: hidden; border-radius: 12px; background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.06); }
 #photoBox img { max-height: 100%; max-width: 100%; object-fit: contain; opacity: 0; transition: opacity 0.4s ease; }
-#mic-chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
+#mic-chart { width: 100%; height: 220px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
 </style>
 </head>
 <body>
 
 <div class="frame">
-  <h1>Wi‑Fi Presence <span>Live</span></h1>
-  <div class="sub">Dual-sensor monitoring: Wi‑Fi RSSI drops and microphone spikes compared to calibrated baselines.</div>
+  <div class="header">
+    <div>
+      <h1>Presence Monitor</h1>
+      <div class="sub">Wi‑Fi drop + mic spike + Doppler</div>
+    </div>
+    <div class="status-group">
+      <div id="status" class="badge ok">Waiting for signal...</div>
+      <div id="reason" class="muted">Calibrate while the path is empty and the room is quiet.</div>
+    </div>
+  </div>
 
-  <div id="status" class="badge ok">Waiting for signal...</div>
-  <div id="reason" class="muted">Calibrate while the path is empty and the room is quiet.</div>
+  <div class="controls">
+    <div class="row">
+      <button onclick="doCalibrate()">Calibrate</button>
+      <div class="muted">Refresh: <span id="rate-label">300 ms</span></div>
+    </div>
+    <div class="row chips">
+      <button class="chip active" data-rate="300" onclick="setRate(this)">300 ms</button>
+      <button class="chip" data-rate="500" onclick="setRate(this)">500 ms</button>
+      <button class="chip" data-rate="1000" onclick="setRate(this)">1 s</button>
+      <button class="chip" data-rate="2000" onclick="setRate(this)">2 s</button>
+    </div>
+    <div class="row">
+      <div class="muted">Mode:</div>
+      <div class="mode-toggle-row">
+        <button class="chip mode-chip active" data-mode="air" onclick="setModeClick(this)">Air</button>
+        <button class="chip mode-chip" data-mode="wall" onclick="setModeClick(this)">Wall</button>
+      </div>
+    </div>
+    <div class="row">
+      <div class="muted">Threshold:</div>
+      <input id="threshold-input" type="number" value="6" min="1" max="40" onchange="updateThreshold()" />
+    </div>
+  </div>
 
   <div class="grid">
     <div class="card">
       <div class="label">Current RSSI</div>
       <div class="value"><span id="rssi">?</span> dBm</div>
-      <div class="muted">Updates every second</div>
     </div>
     <div class="card">
       <div class="label">Baseline</div>
       <div class="value"><span id="baseline">?</span> dBm</div>
-      <div class="muted">Persisted across restarts</div>
     </div>
     <div class="card">
       <div class="label">Wi‑Fi Threshold</div>
       <div class="value"><span id="threshold">6</span> dB</div>
-      <div class="muted">Drop relative to baseline</div>
-      <div class="muted">
-        <label for="threshold-input">Set threshold:</label>
-        <input id="threshold-input" type="number" value="6" min="1" max="40" onchange="updateThreshold()" style="width: 80px; margin-left: 6px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(15,23,42,0.9); color: #e5e7eb; padding: 4px 8px;" />
-      </div>
-      <div class="muted" style="margin-top: 8px;">
-        Mode:
-        <div class="mode-toggle-row">
-          <button class="chip mode-chip active" data-mode="air" onclick="setModeClick(this)">Air</button>
-          <button class="chip mode-chip" data-mode="wall" onclick="setModeClick(this)">Wall</button>
-        </div>
-      </div>
     </div>
     <div class="card">
       <div class="label">Mic Level</div>
@@ -667,51 +692,37 @@ button:active { transform: translateY(0); box-shadow: none; }
     </div>
   </div>
 
-  <div class="actions">
-    <button onclick="doCalibrate()">Calibrate (clear path & quiet)</button>
-    <div class="toggles">
-      <button class="chip active" data-rate="300" onclick="setRate(this)">300 ms</button>
-      <button class="chip" data-rate="500" onclick="setRate(this)">500 ms</button>
-      <button class="chip" data-rate="1000" onclick="setRate(this)">1 s</button>
-      <button class="chip" data-rate="2000" onclick="setRate(this)">2 s</button>
-    </div>
-    <div class="muted">Refresh rate: <span id="rate-label">300 ms</span> • Detection via Wi‑Fi drop OR mic spike</div>
-  </div>
-
-  <div class="chart-card">
-    <div class="chart-head">
-      <div>
-        <div class="title">RSSI Over Time</div>
-        <div class="subtle">Latest samples from the sampler loop</div>
+  <div class="chart-area">
+    <div class="chart-card">
+      <div class="chart-head">
+        <div>
+          <div class="title">RSSI</div>
+          <div class="subtle">Live vs baseline</div>
+        </div>
+        <div class="chart-legend">
+          <span><span class="dot live"></span>Live</span>
+          <span><span class="dot base"></span>Baseline</span>
+        </div>
       </div>
-      <div class="chart-legend">
-        <span><span class="dot live"></span>Live RSSI</span>
-        <span><span class="dot base"></span>Baseline</span>
-      </div>
-    </div>
-
-    <div id="chartContainer">
+      <div id="chartContainer">
         <canvas id="chart"></canvas>
-    </div>
-
-    <div id="photoContainer">
-        <div id="photoBox"></div>
-    </div>
-
-  </div>
-
-  <div class="chart-card">
-    <div class="chart-head">
-      <div>
-        <div class="title">Mic Level Over Time</div>
-        <div class="subtle">Short RMS snapshots from the default microphone</div>
-      </div>
-      <div class="chart-legend">
-        <span><span class="dot live" style="background:#a855f7; box-shadow: 0 0 12px rgba(168,85,247,0.7);"></span>Mic level</span>
-        <span><span class="dot base"></span>Baseline</span>
       </div>
     </div>
-    <canvas id="mic-chart"></canvas>
+
+    <div class="chart-card">
+      <div class="chart-head">
+        <div>
+          <div class="title">Mic & Photo</div>
+          <div class="subtle">Recent mic samples + latest frame</div>
+        </div>
+        <div class="chart-legend">
+          <span><span class="dot live" style="background:#a855f7; box-shadow: 0 0 12px rgba(168,85,247,0.7);"></span>Mic</span>
+          <span><span class="dot base"></span>Baseline</span>
+        </div>
+      </div>
+      <canvas id="mic-chart"></canvas>
+      <div id="photoBox"></div>
+    </div>
   </div>
 </div>
 
