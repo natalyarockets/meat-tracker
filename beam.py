@@ -4,7 +4,12 @@ import threading
 from collections import deque
 from pathlib import Path
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
+import datetime
+import os
+
+last_photo_path = None
+last_detected = False
 
 # Optional microphone support (sounddevice + numpy)
 try:
@@ -21,8 +26,8 @@ app = FastAPI()
 
 latest_rssi = None
 baseline = None
-threshold = 6   # dB drop = HUMAN detected
-history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
+threshold = 6
+history = deque(maxlen=600)
 BASELINE_PATH = Path("baseline.txt")
 
 # Microphone levels (dBFS-ish), tracked separately from RSSI
@@ -33,11 +38,6 @@ mic_history = deque(maxlen=600)
 MIC_BASELINE_PATH = Path("mic_baseline.txt")
 
 def read_rssi_wdutil():
-    """
-    Runs: sudo wdutil info
-    Parses RSSI and Noise values.
-    Returns (rssi, noise) or (None, None)
-    """
     try:
         out = subprocess.check_output(
             ["sudo", "wdutil", "info"],
@@ -94,23 +94,35 @@ def read_mic_level(duration: float = 0.25, samplerate: int = 16000):
 
 
 def load_baseline():
-    """Load baseline RSSI from disk if available."""
     global baseline
     if not BASELINE_PATH.exists():
         return
     try:
         baseline = int(BASELINE_PATH.read_text().strip())
-    except Exception as exc:
-        print(f"WARNING: failed to load baseline: {exc}")
+    except Exception:
         baseline = None
 
 
 def persist_baseline(value: int):
-    """Persist baseline RSSI to disk."""
     try:
         BASELINE_PATH.write_text(str(value))
+    except Exception:
+        pass
+
+
+def take_photo():
+    global last_photo_path
+
+    os.makedirs("photos", exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"photos/capture_{ts}.jpg"
+
+    try:
+        subprocess.run(["imagesnap", "-w", "0.8", filename], check=True)
+        last_photo_path = filename
     except Exception as exc:
-        print(f"WARNING: failed to persist baseline: {exc}")
+        print(f"ERROR capturing photo: {exc}")
 
 
 def load_mic_baseline():
@@ -134,20 +146,26 @@ def persist_mic_baseline(value: float):
 
 
 def sampler_loop():
-    global latest_rssi, history
+    global latest_rssi, history, last_detected
     while True:
         try:
-            print("DEBUG: calling wdutil...")
             rssi, noise = read_rssi_wdutil()
-            print("DEBUG: rssi returned =", rssi)
-            print("DEBUG: noise returned =", noise)
             latest_rssi = rssi
+
             if rssi is not None:
                 history.append((time.time(), rssi))
+
+            if baseline is not None and rssi is not None:
+                detected_now = (rssi <= baseline - threshold)
+
+                if detected_now and not last_detected:
+                    take_photo()
+
+                last_detected = detected_now
+
         except Exception as exc:
             print(f"ERROR: sampler loop failed: {exc}")
         time.sleep(1)
-
 
 def mic_sampler_loop():
     global latest_mic_level, mic_history
@@ -165,10 +183,23 @@ def mic_sampler_loop():
         time.sleep(1)
 
 
+def warm_camera():
+    try:
+        os.makedirs("photos", exist_ok=True)
+        subprocess.run(["imagesnap", "-w", "1", "photos/warmup.jpg"], check=False)
+    except Exception:
+        pass
+    try:
+        os.remove("photos/warmup.jpg")
+    except Exception:
+        pass
+
+
 @app.on_event("startup")
 def start_sampler():
     load_baseline()
     load_mic_baseline()
+    warm_camera()
     thread = threading.Thread(target=sampler_loop, daemon=True)
     thread.start()
     if MIC_AVAILABLE:
@@ -233,7 +264,16 @@ def metrics():
             {"t": int(ts * 1000), "level": val}
             for ts, val in mic_history
         ],
+        "last_photo": last_photo_path,
+        "last_photo": last_photo_path,
     }
+
+
+@app.get("/photo")
+def photo():
+    if last_photo_path and os.path.exists(last_photo_path):
+        return FileResponse(last_photo_path)
+    return {"error": "no photo yet"}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -354,6 +394,7 @@ button {
 button:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgba(34,211,238,0.25); }
 button:active { transform: translateY(0); box-shadow: none; }
 .muted { color: var(--muted); font-size: 14px; margin-top: 6px; }
+
 .chart-card {
     margin-top: 24px;
     background: var(--card);
@@ -368,7 +409,12 @@ button:active { transform: translateY(0); box-shadow: none; }
 .chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
 .dot.base { background: var(--accent-2); }
-#chart, #mic-chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
+#chartContainer { position: relative; z-index: 1; height: 260px; }
+#chart { width: 100%; height: 100%; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
+#photoContainer { position: relative; z-index: 2; margin-top: 30px; }
+#photoBox { width: 100%; height: 320px; display: flex; justify-content: center; align-items: center; overflow: hidden; }
+#photoBox img { max-height: 100%; max-width: 100%; object-fit: contain; opacity: 0; transition: opacity 0.4s ease; }
+#mic-chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
 </style>
 </head>
 <body>
@@ -430,7 +476,15 @@ button:active { transform: translateY(0); box-shadow: none; }
         <span><span class="dot base"></span>Baseline</span>
       </div>
     </div>
-    <canvas id="chart"></canvas>
+
+    <div id="chartContainer">
+        <canvas id="chart"></canvas>
+    </div>
+
+    <div id="photoContainer">
+        <div id="photoBox"></div>
+    </div>
+
   </div>
 
   <div class="chart-card">
@@ -608,6 +662,18 @@ async function update() {
         renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
         renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, data.mic_available ? "Waiting for mic samples…" : "Mic unavailable");
 
+        if (data.last_photo) {
+            const box = document.getElementById("photoBox");
+            let img = box.querySelector("img");
+            if (!img) {
+                img = document.createElement("img");
+                box.appendChild(img);
+            }
+            img.style.opacity = 0;
+            img.onload = () => { img.style.opacity = 1; };
+            img.src = "/photo?cache=" + Math.random();
+        }
+
         const status = document.getElementById("status");
         const reason = document.getElementById("reason");
         const reasons = [];
@@ -662,8 +728,8 @@ function resizeAll() {
     ensureCanvasSize(micCanvas, micCtx, micSize);
 }
 
-update();
 resizeAll();
+update();
 pollHandle = setInterval(update, pollMs);
 window.addEventListener('resize', () => {
     resizeAll();
