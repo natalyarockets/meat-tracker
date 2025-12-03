@@ -1,3 +1,4 @@
+
 import asyncio
 import datetime
 import os
@@ -8,6 +9,7 @@ from collections import deque
 from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -24,6 +26,13 @@ except Exception as exc:
 
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 latest_rssi = None
 baseline = None
 threshold = 6  # dB drop = HUMAN detected
