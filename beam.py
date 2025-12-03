@@ -1,9 +1,10 @@
 import subprocess
 import time
 import threading
+import asyncio
 from collections import deque
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
@@ -11,6 +12,8 @@ app = FastAPI()
 latest_rssi = None
 baseline = None
 threshold = 6   # dB drop = HUMAN detected
+mode = "air"
+thresholds = {"air": 6, "wall": 10}
 history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
 
@@ -103,9 +106,33 @@ def calibrate():
     return {"baseline": baseline}
 
 
-@app.get("/metrics")
-def metrics():
-    global latest_rssi, baseline, threshold
+@app.post("/threshold")
+def set_threshold(value: int):
+    global threshold, mode, thresholds
+    if value < 1:
+        value = 1
+    if value > 40:
+        value = 40
+    threshold = value
+    thresholds[mode] = value
+    return {"threshold": threshold}
+
+
+@app.post("/mode")
+def set_mode(new_mode: str):
+    global mode, threshold, thresholds
+    if new_mode not in ("air", "wall"):
+        return {"error": "invalid mode"}
+    mode = new_mode
+    if mode in thresholds:
+        threshold = thresholds[mode]
+    else:
+        thresholds[mode] = threshold
+    return {"mode": mode, "threshold": threshold}
+
+
+def build_metrics_payload():
+    global latest_rssi, baseline, threshold, mode, thresholds, history
 
     detected = False
     if latest_rssi is not None and baseline is not None:
@@ -114,12 +141,31 @@ def metrics():
     return {
         "rssi": latest_rssi,
         "baseline": baseline,
+        "mode": mode,
+        "threshold": threshold,
         "detected": detected,
         "history": [
             {"t": int(ts * 1000), "rssi": val}
             for ts, val in history
         ],
     }
+
+
+@app.get("/metrics")
+def metrics():
+    return build_metrics_payload()
+
+
+@app.websocket("/ws")
+async def websocket_metrics(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            payload = build_metrics_payload()
+            await ws.send_json(payload)
+            await asyncio.sleep(0.3)
+    except WebSocketDisconnect:
+        pass
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -225,6 +271,11 @@ button.chip.active {
     border-color: rgba(34,211,238,0.45);
     color: var(--accent);
 }
+.mode-toggle-row {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: 6px;
+}
 button {
     font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
     font-size: 16px;
@@ -280,6 +331,17 @@ button:active { transform: translateY(0); box-shadow: none; }
       <div class="label">Threshold</div>
       <div class="value"><span id="threshold">6</span> dB</div>
       <div class="muted">Drop relative to baseline</div>
+      <div class="muted">
+        <label for="threshold-input">Set threshold:</label>
+        <input id="threshold-input" type="number" value="6" min="1" max="40" onchange="updateThreshold()" style="width: 80px; margin-left: 6px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(15,23,42,0.9); color: #e5e7eb; padding: 4px 8px;" />
+      </div>
+      <div class="muted" style="margin-top: 8px;">
+        Mode:
+        <div class="mode-toggle-row">
+          <button class="chip mode-chip active" data-mode="air" onclick="setModeClick(this)">Air</button>
+          <button class="chip mode-chip" data-mode="wall" onclick="setModeClick(this)">Wall</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -311,10 +373,11 @@ button:active { transform: translateY(0); box-shadow: none; }
 
 <script>
 let threshold = 6;
+let mode = "air";
 let pollMs = 300;
-let pollHandle = null;
 let chartPoints = [];
 let lastBaseline = null;
+let socket = null;
 
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -409,36 +472,125 @@ function renderChart(points, baseline) {
     ctx.fill();
     ctx.stroke();
 }
+function handleMetricsData(data) {
+    document.getElementById("rssi").textContent = data.rssi ?? "?";
+    document.getElementById("baseline").textContent =
+        data.baseline === null ? "?" : data.baseline;
 
-async function update() {
-    try {
-        const res = await fetch("/metrics");
-        const data = await res.json();
+    if (typeof data.mode === "string") {
+        mode = data.mode;
+        const buttons = document.querySelectorAll(".mode-chip");
+        buttons.forEach(b => {
+            if (b.getAttribute("data-mode") === mode) {
+                b.classList.add("active");
+            } else {
+                b.classList.remove("active");
+            }
+        });
+    }
+    if (typeof data.threshold === "number") {
+        threshold = data.threshold;
+    }
+    document.getElementById("threshold").textContent = threshold;
+    const thresholdInput = document.getElementById("threshold-input");
+    if (thresholdInput && document.activeElement !== thresholdInput) {
+        thresholdInput.value = threshold;
+    }
 
-        document.getElementById("rssi").textContent = data.rssi ?? "?";
-        document.getElementById("baseline").textContent =
-            data.baseline === null ? "?" : data.baseline;
-        document.getElementById("threshold").textContent = threshold;
-        chartPoints = data.history || [];
-        lastBaseline = data.baseline;
-        renderChart(chartPoints, lastBaseline);
+    chartPoints = data.history || [];
+    lastBaseline = data.baseline;
+    renderChart(chartPoints, lastBaseline);
 
-        const status = document.getElementById("status");
+    const status = document.getElementById("status");
+    if (data.detected) {
+        status.textContent = "Presence detected";
+        status.className = "badge alert";
+    } else if (data.rssi === null) {
+        status.textContent = "Waiting for RSSI...";
+        status.className = "badge ok";
+    } else {
+        status.textContent = "Path is clear";
+        status.className = "badge ok";
+    }
+}
 
-        if (data.detected) {
-            status.textContent = "Presence detected";
-            status.className = "badge alert";
-        } else if (data.rssi === null) {
-            status.textContent = "Waiting for RSSI...";
-            status.className = "badge ok";
-        } else {
-            status.textContent = "Path is clear";
-            status.className = "badge ok";
+function connectWebSocket() {
+    const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+    socket = new WebSocket(`${wsProtocol}://${location.host}/ws`);
+
+    socket.onopen = () => {
+        console.log("WebSocket connected");
+    };
+
+    socket.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            handleMetricsData(data);
+        } catch (e) {
+            console.error("Failed to parse WS message", e);
         }
-    } catch (e) {
+    };
+
+    socket.onclose = () => {
+        console.log("WebSocket closed, retrying in 2s...");
+        setTimeout(connectWebSocket, 2000);
         const status = document.getElementById("status");
         status.textContent = "Connection lost";
         status.className = "badge alert";
+    };
+
+    socket.onerror = (err) => {
+        console.error("WebSocket error", err);
+    };
+}
+
+async function setMode(newMode) {
+    if (!newMode) return;
+    try {
+        const res = await fetch(`/mode?new_mode=${encodeURIComponent(newMode)}`, { method: "POST" });
+        const data = await res.json();
+        if (data.error) return;
+        if (typeof data.mode === "string") {
+            mode = data.mode;
+        }
+        if (typeof data.threshold === "number") {
+            threshold = data.threshold;
+            document.getElementById("threshold").textContent = threshold;
+            const input = document.getElementById("threshold-input");
+            if (input) {
+                input.value = threshold;
+            }
+        }
+        const buttons = document.querySelectorAll(".mode-chip");
+        buttons.forEach(b => {
+            if (b.getAttribute("data-mode") === mode) {
+                b.classList.add("active");
+            } else {
+                b.classList.remove("active");
+            }
+        });
+    } catch (e) {
+        // ignore; UI will resync on next poll
+    }
+}
+
+function setModeClick(buttonEl) {
+    const newMode = buttonEl.getAttribute("data-mode");
+    if (!newMode) return;
+    setMode(newMode);
+}
+
+async function updateThreshold() {
+    const input = document.getElementById("threshold-input");
+    if (!input) return;
+    const value = parseInt(input.value, 10);
+    if (Number.isNaN(value)) return;
+    try {
+        await fetch(`/threshold?value=${encodeURIComponent(value)}`, { method: "POST" });
+        threshold = value;
+        document.getElementById("threshold").textContent = threshold;
+    } catch (e) {
+        // ignore errors; UI will reflect correct value on next poll
     }
 }
 
@@ -448,8 +600,6 @@ function setRate(buttonEl) {
     document.getElementById("rate-label").textContent = ms >= 1000 ? `${ms/1000} s` : `${ms} ms`;
     document.querySelectorAll(".chip").forEach(b => b.classList.remove("active"));
     buttonEl.classList.add("active");
-    if (pollHandle) clearInterval(pollHandle);
-    pollHandle = setInterval(update, pollMs);
 }
 
 async function doCalibrate() {
@@ -457,12 +607,10 @@ async function doCalibrate() {
     status.textContent = "Calibrating...";
     status.className = "badge ok";
     await fetch("/calibrate", {method: "POST"});
-    await update();
 }
 
-update();
 resizeCanvas();
-pollHandle = setInterval(update, pollMs);
+connectWebSocket();
 window.addEventListener('resize', () => {
     resizeCanvas();
     renderChart(chartPoints, lastBaseline);
