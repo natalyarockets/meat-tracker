@@ -17,12 +17,8 @@ thresholds = {"air": 6, "wall": 10}
 history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
 
+
 def read_rssi_wdutil():
-    """
-    Runs: sudo wdutil info
-    Parses RSSI and Noise values.
-    Returns (rssi, noise) or (None, None)
-    """
     try:
         out = subprocess.check_output(
             ["sudo", "wdutil", "info"],
@@ -54,44 +50,76 @@ def read_rssi_wdutil():
 
 
 def load_baseline():
-    """Load baseline RSSI from disk if available."""
     global baseline
     if not BASELINE_PATH.exists():
         return
     try:
         baseline = int(BASELINE_PATH.read_text().strip())
-    except Exception as exc:
-        print(f"WARNING: failed to load baseline: {exc}")
+    except Exception:
         baseline = None
 
 
 def persist_baseline(value: int):
-    """Persist baseline RSSI to disk."""
     try:
         BASELINE_PATH.write_text(str(value))
+    except Exception:
+        pass
+
+
+def take_photo():
+    global last_photo_path
+
+    os.makedirs("photos", exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"photos/capture_{ts}.jpg"
+
+    try:
+        subprocess.run(["imagesnap", "-w", "0.8", filename], check=True)
+        last_photo_path = filename
     except Exception as exc:
-        print(f"WARNING: failed to persist baseline: {exc}")
+        print(f"ERROR capturing photo: {exc}")
 
 
 def sampler_loop():
-    global latest_rssi, history
+    global latest_rssi, history, last_detected
     while True:
         try:
-            print("DEBUG: calling wdutil...")
             rssi, noise = read_rssi_wdutil()
-            print("DEBUG: rssi returned =", rssi)
-            print("DEBUG: noise returned =", noise)
             latest_rssi = rssi
+
             if rssi is not None:
                 history.append((time.time(), rssi))
+
+            if baseline is not None and rssi is not None:
+                detected_now = (rssi <= baseline - threshold)
+
+                if detected_now and not last_detected:
+                    take_photo()
+
+                last_detected = detected_now
+
         except Exception as exc:
             print(f"ERROR: sampler loop failed: {exc}")
         time.sleep(1)
 
 
+def warm_camera():
+    try:
+        os.makedirs("photos", exist_ok=True)
+        subprocess.run(["imagesnap", "-w", "1", "photos/warmup.jpg"], check=False)
+    except Exception:
+        pass
+    try:
+        os.remove("photos/warmup.jpg")
+    except:
+        pass
+
+
 @app.on_event("startup")
 def start_sampler():
     load_baseline()
+    warm_camera()
     thread = threading.Thread(target=sampler_loop, daemon=True)
     thread.start()
 
@@ -291,6 +319,7 @@ button {
 button:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgba(34,211,238,0.25); }
 button:active { transform: translateY(0); box-shadow: none; }
 .muted { color: var(--muted); font-size: 14px; margin-top: 6px; }
+
 .chart-card {
     margin-top: 24px;
     background: var(--card);
@@ -298,20 +327,50 @@ button:active { transform: translateY(0); box-shadow: none; }
     border-radius: 16px;
     padding: 16px;
 }
-.chart-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
-.chart-head .title { font-weight: 700; font-size: 18px; }
-.chart-head .subtle { color: var(--muted); font-size: 14px; }
-.chart-legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 14px; }
-.chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-.dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
-.dot.base { background: var(--accent-2); }
-#chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
+
+/* Fixed layout for chart + photo, to prevent vertical jumping */
+#chartContainer {
+    position: relative;
+    z-index: 1;
+    height: 260px; /* matches chart logical height */
+}
+
+#photoContainer {
+    position: relative;
+    z-index: 2;
+    margin-top: 30px;
+}
+
+#chart {
+    width: 100%;
+    height: 100%;  /* fill the fixed container height */
+    border-radius: 12px;
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0));
+    border: 1px solid rgba(255,255,255,0.06);
+}
+
+#photoBox {
+    width: 100%;
+    height: 320px;   /* fixed, so adding an image never changes layout */
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    overflow: hidden;
+}
+
+#photoBox img {
+    max-height: 100%;
+    max-width: 100%;
+    object-fit: contain;
+    opacity: 0;
+    transition: opacity 0.4s ease;
+}
 </style>
 </head>
 <body>
 
 <div class="frame">
-  <h1>Wi‑Fi Presence <span>Live</span></h1>
+  <h1>Wi-Fi Presence <span>Live</span></h1>
   <div class="sub">Monitors RSSI drops against a calibrated baseline. Run calibration when no one is in the path.</div>
 
   <div id="status" class="badge ok">Waiting for signal...</div>
@@ -367,7 +426,15 @@ button:active { transform: translateY(0); box-shadow: none; }
         <span><span class="dot base"></span>Baseline</span>
       </div>
     </div>
-    <canvas id="chart"></canvas>
+
+    <div id="chartContainer">
+        <canvas id="chart"></canvas>
+    </div>
+
+    <div id="photoContainer">
+        <div id="photoBox"></div>
+    </div>
+
   </div>
 </div>
 
@@ -384,8 +451,10 @@ const ctx = canvas.getContext("2d");
 const dpr = window.devicePixelRatio || 1;
 let chartSize = {width: 0, height: 0};
 
+const chartContainer = document.getElementById("chartContainer");
+
 function resizeCanvas() {
-    const rect = canvas.getBoundingClientRect();
+    const rect = chartContainer.getBoundingClientRect();
     chartSize = {width: rect.width, height: rect.height};
     canvas.width = rect.width * dpr;
     canvas.height = rect.height * dpr;
