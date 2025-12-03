@@ -9,6 +9,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 # Optional microphone support (sounddevice + numpy)
 try:
@@ -252,6 +253,9 @@ def start_sampler():
         print("INFO: microphone sampling disabled - sounddevice/numpy not available")
 
 
+app.mount("/photos", StaticFiles(directory="photos"), name="photos")
+
+
 @app.post("/calibrate")
 def calibrate():
     global baseline, mic_baseline
@@ -300,7 +304,7 @@ def set_mode(new_mode: str):
 
 
 def build_metrics_payload():
-    global latest_rssi, baseline, threshold, mode, thresholds, history
+    global latest_rssi, baseline, threshold, mode, thresholds, history, last_photo_path
 
     rssi_detected = False
     mic_detected = False
@@ -309,6 +313,11 @@ def build_metrics_payload():
     if MIC_AVAILABLE and latest_mic_level is not None and mic_baseline is not None:
         mic_detected = bool(latest_mic_level >= mic_baseline + mic_threshold)
     detected = rssi_detected or mic_detected
+
+    photo_url = None
+    if last_photo_path:
+        # Serve via /photos/<filename>
+        photo_url = f"/photos/{os.path.basename(last_photo_path)}"
 
     return {
         "rssi": latest_rssi,
@@ -323,6 +332,7 @@ def build_metrics_payload():
         "mic_available": MIC_AVAILABLE,
         "mic_error": MIC_ERROR if not MIC_AVAILABLE else None,
         "detected": detected,
+        "photo_url": photo_url,
         "history": [
             {"t": int(ts * 1000), "rssi": val}
             for ts, val in history
@@ -625,6 +635,7 @@ let lastBaseline = null;
 let lastMicBaseline = null;
 let dopplerScore = null;
 let socket = null;
+let lastPhotoUrl = null;
 
 const wifiCanvas = document.getElementById("chart");
 const micCanvas = document.getElementById("mic-chart");
@@ -803,6 +814,22 @@ function handleMetricsData(data) {
         img.style.opacity = 0;
         img.onload = () => { img.style.opacity = 1; };
         img.src = "/photo?cache=" + Math.random();
+    }
+
+    const photoBox = document.getElementById("photoBox");
+    if (photoBox) {
+        const url = data.photo_url;
+        // Only update the DOM if the photo URL actually changed
+        if (url && url !== lastPhotoUrl) {
+            lastPhotoUrl = url;
+            photoBox.innerHTML = "";
+            const img = document.createElement("img");
+            img.src = url + `?t=${Date.now()}`; // cache-bust so latest photo loads
+            img.onload = () => {
+                img.style.opacity = "1";
+            };
+            photoBox.appendChild(img);
+        }
     }
 
     const status = document.getElementById("status");
