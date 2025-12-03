@@ -51,6 +51,7 @@ mic_baseline = None
 mic_threshold = 6  # dB increase = HUMAN detected
 mic_history = deque(maxlen=600)
 MIC_BASELINE_PATH = Path("mic_baseline.txt")
+MIC_DEVICE = os.environ.get("MIC_DEVICE")  # optional device name or index
 
 # Doppler-style motion score around a high-frequency carrier
 DOPPLER_CARRIER_HZ = 19000
@@ -61,6 +62,9 @@ DOPPLER_FRAMES = 2048
 doppler_score = None
 doppler_history = deque(maxlen=600)
 _doppler_prev_band = None
+
+# Mic samplerate (defaults to Doppler samplerate)
+MIC_SAMPLERATE = int(os.environ.get("MIC_SAMPLERATE", DOPPLER_SAMPLERATE))
 
 
 def read_rssi_wdutil():
@@ -117,6 +121,53 @@ def read_mic_level(duration: float = 0.25, samplerate: int = 16000):
         MIC_ERROR = str(exc)
         print(f"WARNING: mic sample failed: {exc}")
         return None
+
+
+def init_microphone():
+    """Select a usable input device for sounddevice."""
+    global MIC_AVAILABLE, MIC_ERROR
+    if not MIC_AVAILABLE:
+        return
+    try:
+        # Try to discover devices once
+        devices = sd.query_devices()
+        input_indices = [i for i, d in enumerate(devices) if d.get("max_input_channels", 0) > 0]
+
+        if MIC_DEVICE:
+            # Allow either numeric index or device name
+            dev = int(MIC_DEVICE) if MIC_DEVICE.isdigit() else MIC_DEVICE
+            current_out = None
+            if isinstance(sd.default.device, (list, tuple)) and len(sd.default.device) > 1:
+                current_out = sd.default.device[1]
+            sd.default.device = (dev, current_out)
+            info = sd.query_devices(dev, "input")
+        else:
+            if not input_indices:
+                MIC_AVAILABLE = False
+                MIC_ERROR = "no input devices found"
+                print("WARNING: mic init failed - no input devices found")
+                return
+            # Prefer the first input-capable device
+            current_out = None
+            if isinstance(sd.default.device, (list, tuple)) and len(sd.default.device) > 1:
+                current_out = sd.default.device[1]
+            sd.default.device = (input_indices[0], current_out)
+            info = sd.query_devices(input_indices[0], "input")
+
+        # Pick a samplerate the device supports
+        sr = MIC_SAMPLERATE
+        try:
+            sd.check_input_settings(device=sd.default.device[0], samplerate=sr, channels=1)
+        except Exception:
+            sr = int(info.get("default_samplerate") or DOPPLER_SAMPLERATE)
+            sd.check_input_settings(device=sd.default.device[0], samplerate=sr, channels=1)
+        sd.default.samplerate = sr
+        MIC_ERROR = None
+        print(f"INFO: mic init selected device {sd.default.device[0]} -> {info.get('name')} @ {sr} Hz")
+    except Exception as exc:
+        MIC_AVAILABLE = False
+        MIC_ERROR = f"mic init failed: {exc}"
+        print(f"ERROR: mic init failed: {exc}")
 
 
 def load_baseline():
@@ -196,7 +247,9 @@ def sampler_loop():
 
 
 def mic_sampler_loop():
-    global latest_mic_level, mic_history, doppler_score, doppler_history, _doppler_prev_band
+    global latest_mic_level, mic_history, doppler_score, doppler_history, _doppler_prev_band, MIC_ERROR
+    init_microphone()
+    stream = None
     while True:
         if not MIC_AVAILABLE:
             time.sleep(1)
@@ -216,6 +269,31 @@ def mic_sampler_loop():
                 audio = audio.flatten()
                 rms = float(np.sqrt(np.mean(np.square(audio))))
                 latest_mic_level = round(20 * np.log10(rms), 1) if rms > 0 else -120.0
+            if stream is None:
+                stream = sd.InputStream(
+                    device=sd.default.device[0] if isinstance(sd.default.device, (list, tuple)) else sd.default.device,
+                    channels=1,
+                    samplerate=sd.default.samplerate or MIC_SAMPLERATE,
+                    dtype="float32",
+                    blocksize=DOPPLER_FRAMES,
+                )
+                stream.start()
+
+            frames = max(1, DOPPLER_FRAMES)
+            audio, _ = stream.read(frames)
+            if audio is None:
+                latest_mic_level = None
+                MIC_ERROR = "mic returned no data"
+            else:
+                audio = audio.flatten()
+                rms = float(np.sqrt(np.mean(np.square(audio))))
+                if rms <= 1e-9:
+                    latest_mic_level = -120.0
+                    MIC_ERROR = "mic signal near zero"
+                    print("WARNING: mic sampler saw near-zero audio; check input source/permissions")
+                else:
+                    latest_mic_level = round(20 * np.log10(rms), 1)
+                    MIC_ERROR = None
                 mic_history.append((time.time(), latest_mic_level))
 
                 # Doppler-style motion metric: spectral change near carrier
@@ -232,10 +310,15 @@ def mic_sampler_loop():
                         doppler_history.append((time.time(), doppler_score))
                     _doppler_prev_band = band
         except Exception as exc:
+            MIC_ERROR = str(exc)
             print(f"ERROR: mic sampler loop failed: {exc}")
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream = None
         time.sleep(1)
-
-
 def warm_camera():
     try:
         os.makedirs("photos", exist_ok=True)
@@ -339,7 +422,7 @@ def build_metrics_payload():
         "mic_threshold": mic_threshold,
         "mic_detected": mic_detected,
         "mic_available": MIC_AVAILABLE,
-        "mic_error": MIC_ERROR if not MIC_AVAILABLE else None,
+        "mic_error": MIC_ERROR,
         "detected": detected,
         "photo_url": photo_url,
         "history": [
@@ -801,7 +884,7 @@ function handleMetricsData(data) {
     if (!data.mic_available) {
         micState.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
     } else if (data.mic_level === null || data.mic_level === undefined) {
-        micState.textContent = "Waiting for mic samples…";
+        micState.textContent = data.mic_error ? `Mic issue (${data.mic_error})` : "Waiting for mic samples…";
     } else {
         micState.textContent = "Ambient level vs baseline";
     }
