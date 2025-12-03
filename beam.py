@@ -1,6 +1,7 @@
 import subprocess
 import time
 import threading
+from collections import deque
 from pathlib import Path
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
@@ -10,6 +11,7 @@ app = FastAPI()
 latest_rssi = None
 baseline = None
 threshold = 6   # dB drop = HUMAN detected
+history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
 
 def read_rssi_wdutil():
@@ -69,7 +71,7 @@ def persist_baseline(value: int):
 
 
 def sampler_loop():
-    global latest_rssi
+    global latest_rssi, history
     while True:
         try:
             print("DEBUG: calling wdutil...")
@@ -77,6 +79,8 @@ def sampler_loop():
             print("DEBUG: rssi returned =", rssi)
             print("DEBUG: noise returned =", noise)
             latest_rssi = rssi
+            if rssi is not None:
+                history.append((time.time(), rssi))
         except Exception as exc:
             print(f"ERROR: sampler loop failed: {exc}")
         time.sleep(1)
@@ -110,7 +114,11 @@ def metrics():
     return {
         "rssi": latest_rssi,
         "baseline": baseline,
-        "detected": detected
+        "detected": detected,
+        "history": [
+            {"t": int(ts * 1000), "rssi": val}
+            for ts, val in history
+        ],
     }
 
 
@@ -232,6 +240,21 @@ button {
 button:hover { transform: translateY(-1px); box-shadow: 0 12px 24px rgba(34,211,238,0.25); }
 button:active { transform: translateY(0); box-shadow: none; }
 .muted { color: var(--muted); font-size: 14px; margin-top: 6px; }
+.chart-card {
+    margin-top: 24px;
+    background: var(--card);
+    border: 1px solid rgba(255,255,255,0.05);
+    border-radius: 16px;
+    padding: 16px;
+}
+.chart-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; flex-wrap: wrap; margin-bottom: 8px; }
+.chart-head .title { font-weight: 700; font-size: 18px; }
+.chart-head .subtle { color: var(--muted); font-size: 14px; }
+.chart-legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 14px; }
+.chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
+.dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
+.dot.base { background: var(--accent-2); }
+#chart { width: 100%; height: 260px; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
 </style>
 </head>
 <body>
@@ -270,12 +293,122 @@ button:active { transform: translateY(0); box-shadow: none; }
     </div>
     <div class="muted">Refresh rate: <span id="rate-label">300 ms</span></div>
   </div>
+
+  <div class="chart-card">
+    <div class="chart-head">
+      <div>
+        <div class="title">RSSI Over Time</div>
+        <div class="subtle">Latest samples from the sampler loop</div>
+      </div>
+      <div class="chart-legend">
+        <span><span class="dot live"></span>Live RSSI</span>
+        <span><span class="dot base"></span>Baseline</span>
+      </div>
+    </div>
+    <canvas id="chart"></canvas>
+  </div>
 </div>
 
 <script>
 let threshold = 6;
 let pollMs = 300;
 let pollHandle = null;
+let chartPoints = [];
+let lastBaseline = null;
+
+const canvas = document.getElementById("chart");
+const ctx = canvas.getContext("2d");
+const dpr = window.devicePixelRatio || 1;
+let chartSize = {width: 0, height: 0};
+
+function resizeCanvas() {
+    const rect = canvas.getBoundingClientRect();
+    chartSize = {width: rect.width, height: rect.height};
+    canvas.width = rect.width * dpr;
+    canvas.height = rect.height * dpr;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function renderChart(points, baseline) {
+    if (!canvas) return;
+    if (!chartSize.width || !chartSize.height) {
+        resizeCanvas();
+    }
+
+    ctx.clearRect(0, 0, chartSize.width, chartSize.height);
+
+    if (!points || !points.length) {
+        ctx.fillStyle = 'rgba(229,231,235,0.6)';
+        ctx.font = '14px Space Grotesk, sans-serif';
+        ctx.fillText('Waiting for samples…', 16, chartSize.height / 2);
+        return;
+    }
+
+    const xs = points.map(p => p.t);
+    const ys = points.map(p => p.rssi);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys, baseline ?? ys[0]);
+    const maxY = Math.max(...ys, baseline ?? ys[0]);
+    const spanX = Math.max(1, maxX - minX);
+    const spanY = Math.max(1, maxY - minY);
+    const margin = 18;
+
+    const x = t => {
+        const n = (t - minX) / spanX;
+        return margin + n * (chartSize.width - margin * 2);
+    };
+
+    const y = v => {
+        const n = (v - minY) / spanY;
+        return chartSize.height - margin - n * (chartSize.height - margin * 2);
+    };
+
+    if (baseline !== null && baseline !== undefined) {
+        ctx.save();
+        ctx.setLineDash([6, 6]);
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 1.2;
+        ctx.beginPath();
+        ctx.moveTo(x(minX), y(baseline));
+        ctx.lineTo(x(maxX), y(baseline));
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    ctx.beginPath();
+    ctx.moveTo(x(points[0].t), y(points[0].rssi));
+    for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(x(points[i].t), y(points[i].rssi));
+    }
+    ctx.lineTo(x(points[points.length - 1].t), chartSize.height - margin);
+    ctx.lineTo(x(points[0].t), chartSize.height - margin);
+    ctx.closePath();
+
+    const gradient = ctx.createLinearGradient(0, margin, 0, chartSize.height - margin);
+    gradient.addColorStop(0, 'rgba(34,211,238,0.3)');
+    gradient.addColorStop(1, 'rgba(34,211,238,0.02)');
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    ctx.beginPath();
+    ctx.moveTo(x(points[0].t), y(points[0].rssi));
+    for (let i = 1; i < points.length; i++) {
+        ctx.lineTo(x(points[i].t), y(points[i].rssi));
+    }
+    ctx.strokeStyle = '#22d3ee';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    const lastPoint = points[points.length - 1];
+    ctx.fillStyle = '#22d3ee';
+    ctx.strokeStyle = '#0f172a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(x(lastPoint.t), y(lastPoint.rssi), 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+}
 
 async function update() {
     try {
@@ -286,6 +419,9 @@ async function update() {
         document.getElementById("baseline").textContent =
             data.baseline === null ? "?" : data.baseline;
         document.getElementById("threshold").textContent = threshold;
+        chartPoints = data.history || [];
+        lastBaseline = data.baseline;
+        renderChart(chartPoints, lastBaseline);
 
         const status = document.getElementById("status");
 
@@ -325,7 +461,12 @@ async function doCalibrate() {
 }
 
 update();
+resizeCanvas();
 pollHandle = setInterval(update, pollMs);
+window.addEventListener('resize', () => {
+    resizeCanvas();
+    renderChart(chartPoints, lastBaseline);
+});
 </script>
 
 </body>
