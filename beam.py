@@ -1,15 +1,14 @@
-import subprocess
-import time
-import threading
-from collections import deque
-from pathlib import Path
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, FileResponse
+import asyncio
 import datetime
 import os
+import subprocess
+import threading
+import time
+from collections import deque
+from pathlib import Path
 
-last_photo_path = None
-last_detected = False
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, HTMLResponse
 
 # Optional microphone support (sounddevice + numpy)
 try:
@@ -26,9 +25,15 @@ app = FastAPI()
 
 latest_rssi = None
 baseline = None
-threshold = 6
-history = deque(maxlen=600)
+threshold = 6  # dB drop = HUMAN detected
+mode = "air"
+thresholds = {"air": 6, "wall": 10}
+history = deque(maxlen=600)  # keep ~10 minutes of 1s samples
 BASELINE_PATH = Path("baseline.txt")
+
+# Photo capture + detection tracking
+last_photo_path = None
+last_detected = False
 
 # Microphone levels (dBFS-ish), tracked separately from RSSI
 latest_mic_level = None
@@ -37,12 +42,13 @@ mic_threshold = 6  # dB increase = HUMAN detected
 mic_history = deque(maxlen=600)
 MIC_BASELINE_PATH = Path("mic_baseline.txt")
 
+
 def read_rssi_wdutil():
     try:
         out = subprocess.check_output(
             ["sudo", "wdutil", "info"],
             text=True,
-            stderr=subprocess.DEVNULL
+            stderr=subprocess.DEVNULL,
         )
     except Exception:
         return None, None
@@ -56,13 +62,13 @@ def read_rssi_wdutil():
         if line.startswith("RSSI"):
             try:
                 rssi = int(line.split(":")[1].replace("dBm", "").strip())
-            except:
+            except Exception:
                 pass
 
         if line.startswith("Noise"):
             try:
                 noise = int(line.split(":")[1].replace("dBm", "").strip())
-            except:
+            except Exception:
                 pass
 
     return rssi, noise
@@ -110,21 +116,6 @@ def persist_baseline(value: int):
         pass
 
 
-def take_photo():
-    global last_photo_path
-
-    os.makedirs("photos", exist_ok=True)
-
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"photos/capture_{ts}.jpg"
-
-    try:
-        subprocess.run(["imagesnap", "-w", "0.8", filename], check=True)
-        last_photo_path = filename
-    except Exception as exc:
-        print(f"ERROR capturing photo: {exc}")
-
-
 def load_mic_baseline():
     """Load baseline microphone level if available."""
     global mic_baseline
@@ -145,6 +136,21 @@ def persist_mic_baseline(value: float):
         print(f"WARNING: failed to persist mic baseline: {exc}")
 
 
+def take_photo():
+    global last_photo_path
+
+    os.makedirs("photos", exist_ok=True)
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"photos/capture_{ts}.jpg"
+
+    try:
+        subprocess.run(["imagesnap", "-w", "0.8", filename], check=True)
+        last_photo_path = filename
+    except Exception as exc:
+        print(f"ERROR capturing photo: {exc}")
+
+
 def sampler_loop():
     global latest_rssi, history, last_detected
     while True:
@@ -155,17 +161,19 @@ def sampler_loop():
             if rssi is not None:
                 history.append((time.time(), rssi))
 
+            detected_now = False
             if baseline is not None and rssi is not None:
-                detected_now = (rssi <= baseline - threshold)
+                detected_now = bool(rssi <= baseline - threshold)
 
-                if detected_now and not last_detected:
-                    take_photo()
+            if detected_now and not last_detected:
+                take_photo()
 
-                last_detected = detected_now
+            last_detected = detected_now
 
         except Exception as exc:
             print(f"ERROR: sampler loop failed: {exc}")
         time.sleep(1)
+
 
 def mic_sampler_loop():
     global latest_mic_level, mic_history
@@ -231,22 +239,46 @@ def calibrate():
     return resp
 
 
-@app.get("/metrics")
-def metrics():
-    global latest_rssi, baseline, threshold, latest_mic_level, mic_baseline, mic_threshold
+@app.post("/threshold")
+def set_threshold(value: int):
+    global threshold, mode, thresholds
+    if value < 1:
+        value = 1
+    if value > 40:
+        value = 40
+    threshold = value
+    thresholds[mode] = value
+    return {"threshold": threshold}
+
+
+@app.post("/mode")
+def set_mode(new_mode: str):
+    global mode, threshold, thresholds
+    if new_mode not in ("air", "wall"):
+        return {"error": "invalid mode"}
+    mode = new_mode
+    if mode in thresholds:
+        threshold = thresholds[mode]
+    else:
+        thresholds[mode] = threshold
+    return {"mode": mode, "threshold": threshold}
+
+
+def build_metrics_payload():
+    global latest_rssi, baseline, threshold, mode, thresholds, history
 
     rssi_detected = False
     mic_detected = False
-
     if latest_rssi is not None and baseline is not None:
         rssi_detected = bool(latest_rssi <= baseline - threshold)
-
     if MIC_AVAILABLE and latest_mic_level is not None and mic_baseline is not None:
         mic_detected = bool(latest_mic_level >= mic_baseline + mic_threshold)
+    detected = rssi_detected or mic_detected
 
     return {
         "rssi": latest_rssi,
         "baseline": baseline,
+        "mode": mode,
         "threshold": threshold,
         "rssi_detected": rssi_detected,
         "mic_level": latest_mic_level,
@@ -255,7 +287,7 @@ def metrics():
         "mic_detected": mic_detected,
         "mic_available": MIC_AVAILABLE,
         "mic_error": MIC_ERROR if not MIC_AVAILABLE else None,
-        "detected": rssi_detected or mic_detected,
+        "detected": detected,
         "history": [
             {"t": int(ts * 1000), "rssi": val}
             for ts, val in history
@@ -265,8 +297,24 @@ def metrics():
             for ts, val in mic_history
         ],
         "last_photo": last_photo_path,
-        "last_photo": last_photo_path,
     }
+
+
+@app.get("/metrics")
+def metrics():
+    return build_metrics_payload()
+
+
+@app.websocket("/ws")
+async def websocket_metrics(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            payload = build_metrics_payload()
+            await ws.send_json(payload)
+            await asyncio.sleep(0.3)
+    except WebSocketDisconnect:
+        pass
 
 
 @app.get("/photo")
@@ -379,6 +427,11 @@ button.chip.active {
     border-color: rgba(34,211,238,0.45);
     color: var(--accent);
 }
+.mode-toggle-row {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: 6px;
+}
 button {
     font-family: 'Space Grotesk', 'Segoe UI', sans-serif;
     font-size: 16px;
@@ -409,6 +462,7 @@ button:active { transform: translateY(0); box-shadow: none; }
 .chart-legend .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 6px; }
 .dot.live { background: var(--accent); box-shadow: 0 0 12px rgba(34,211,238,0.7); }
 .dot.base { background: var(--accent-2); }
+
 #chartContainer { position: relative; z-index: 1; height: 260px; }
 #chart { width: 100%; height: 100%; border-radius: 12px; background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0)); border: 1px solid rgba(255,255,255,0.06); }
 #photoContainer { position: relative; z-index: 2; margin-top: 30px; }
@@ -441,6 +495,17 @@ button:active { transform: translateY(0); box-shadow: none; }
       <div class="label">Wi‑Fi Threshold</div>
       <div class="value"><span id="threshold">6</span> dB</div>
       <div class="muted">Drop relative to baseline</div>
+      <div class="muted">
+        <label for="threshold-input">Set threshold:</label>
+        <input id="threshold-input" type="number" value="6" min="1" max="40" onchange="updateThreshold()" style="width: 80px; margin-left: 6px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.12); background: rgba(15,23,42,0.9); color: #e5e7eb; padding: 4px 8px;" />
+      </div>
+      <div class="muted" style="margin-top: 8px;">
+        Mode:
+        <div class="mode-toggle-row">
+          <button class="chip mode-chip active" data-mode="air" onclick="setModeClick(this)">Air</button>
+          <button class="chip mode-chip" data-mode="wall" onclick="setModeClick(this)">Wall</button>
+        </div>
+      </div>
     </div>
     <div class="card">
       <div class="label">Mic Level</div>
@@ -505,12 +570,14 @@ button:active { transform: translateY(0); box-shadow: none; }
 <script>
 let threshold = 6;
 let micThreshold = 6;
+let mode = "air";
 let pollMs = 300;
 let pollHandle = null;
 let chartPoints = [];
 let micChartPoints = [];
 let lastBaseline = null;
 let lastMicBaseline = null;
+let socket = null;
 
 const wifiCanvas = document.getElementById("chart");
 const micCanvas = document.getElementById("mic-chart");
@@ -624,84 +691,124 @@ function renderSeries(canvas, ctx, size, points, baseline, valueKey, palette, em
     ctx.stroke();
 }
 
-async function update() {
-    try {
-        const res = await fetch("/metrics");
-        const data = await res.json();
+function handleMetricsData(data) {
+    const fmtNum = (val, digits = 1) => {
+        if (val === null || val === undefined) return "?";
+        return typeof val === "number" ? val.toFixed(digits) : val;
+    };
 
-        threshold = data.threshold ?? threshold;
-        micThreshold = data.mic_threshold ?? micThreshold;
+    document.getElementById("rssi").textContent = data.rssi ?? "?";
+    document.getElementById("baseline").textContent =
+        data.baseline === null ? "?" : data.baseline;
 
-        const fmtNum = (val, digits = 1) => {
-            if (val === null || val === undefined) return "?";
-            return typeof val === "number" ? val.toFixed(digits) : val;
-        };
-
-        document.getElementById("rssi").textContent = data.rssi ?? "?";
-        document.getElementById("baseline").textContent =
-            data.baseline === null ? "?" : data.baseline;
-        document.getElementById("threshold").textContent = threshold;
-        document.getElementById("mic-level").textContent = fmtNum(data.mic_level);
-        document.getElementById("mic-baseline").textContent =
-            data.mic_baseline === null || data.mic_baseline === undefined ? "?" : data.mic_baseline.toFixed(1);
-        document.getElementById("mic-threshold").textContent = micThreshold;
-
-        const micState = document.getElementById("mic-state");
-        if (!data.mic_available) {
-            micState.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
-        } else if (data.mic_level === null || data.mic_level === undefined) {
-            micState.textContent = "Waiting for mic samples…";
-        } else {
-            micState.textContent = "Ambient level vs baseline";
-        }
-
-        chartPoints = data.history || [];
-        micChartPoints = data.mic_history || [];
-        lastBaseline = data.baseline;
-        lastMicBaseline = data.mic_baseline;
-        renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
-        renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, data.mic_available ? "Waiting for mic samples…" : "Mic unavailable");
-
-        if (data.last_photo) {
-            const box = document.getElementById("photoBox");
-            let img = box.querySelector("img");
-            if (!img) {
-                img = document.createElement("img");
-                box.appendChild(img);
-            }
-            img.style.opacity = 0;
-            img.onload = () => { img.style.opacity = 1; };
-            img.src = "/photo?cache=" + Math.random();
-        }
-
-        const status = document.getElementById("status");
-        const reason = document.getElementById("reason");
-        const reasons = [];
-        if (data.rssi_detected) reasons.push("Wi‑Fi drop");
-        if (data.mic_detected) reasons.push("Mic spike");
-
-        if (data.detected) {
-            status.textContent = "Presence detected";
-            status.className = "badge alert";
-            reason.textContent = reasons.length ? `Trigger: ${reasons.join(" + ")}` : "Threshold exceeded";
-        } else if (data.rssi === null) {
-            status.textContent = "Waiting for RSSI...";
-            status.className = "badge ok";
-            reason.textContent = "Sampler is warming up.";
-        } else {
-            status.textContent = "Path is clear";
-            status.className = "badge ok";
-            if (!data.mic_available) {
-                reason.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
+    if (typeof data.mode === "string") {
+        mode = data.mode;
+        document.querySelectorAll(".mode-chip").forEach(b => {
+            if (b.getAttribute("data-mode") === mode) {
+                b.classList.add("active");
             } else {
-                reason.textContent = "Watching Wi‑Fi drops and mic spikes vs baselines.";
+                b.classList.remove("active");
             }
+        });
+    }
+    if (typeof data.threshold === "number") {
+        threshold = data.threshold;
+    }
+    micThreshold = data.mic_threshold ?? micThreshold;
+
+    document.getElementById("threshold").textContent = threshold;
+    const thresholdInput = document.getElementById("threshold-input");
+    if (thresholdInput && document.activeElement !== thresholdInput) {
+        thresholdInput.value = threshold;
+    }
+
+    document.getElementById("mic-level").textContent = fmtNum(data.mic_level);
+    document.getElementById("mic-baseline").textContent =
+        data.mic_baseline === null || data.mic_baseline === undefined ? "?" : data.mic_baseline.toFixed(1);
+    document.getElementById("mic-threshold").textContent = micThreshold;
+
+    const micState = document.getElementById("mic-state");
+    if (!data.mic_available) {
+        micState.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
+    } else if (data.mic_level === null || data.mic_level === undefined) {
+        micState.textContent = "Waiting for mic samples…";
+    } else {
+        micState.textContent = "Ambient level vs baseline";
+    }
+
+    chartPoints = data.history || [];
+    micChartPoints = data.mic_history || [];
+    lastBaseline = data.baseline;
+    lastMicBaseline = data.mic_baseline;
+    renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
+    renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, data.mic_available ? "Waiting for mic samples…" : "Mic unavailable");
+
+    if (data.last_photo) {
+        const box = document.getElementById("photoBox");
+        let img = box.querySelector("img");
+        if (!img) {
+            img = document.createElement("img");
+            box.appendChild(img);
         }
-    } catch (e) {
-        const status = document.getElementById("status");
-        status.textContent = "Connection lost";
+        img.style.opacity = 0;
+        img.onload = () => { img.style.opacity = 1; };
+        img.src = "/photo?cache=" + Math.random();
+    }
+
+    const status = document.getElementById("status");
+    const reason = document.getElementById("reason");
+    const reasons = [];
+    if (data.rssi_detected) reasons.push("Wi‑Fi drop");
+    if (data.mic_detected) reasons.push("Mic spike");
+
+    if (data.detected) {
+        status.textContent = "Presence detected";
         status.className = "badge alert";
-        document.getElementById("reason").textContent = "The UI cannot reach /metrics right now.";
+        reason.textContent = reasons.length ? `Trigger: ${reasons.join(" + ")}` : "Threshold exceeded";
+    } else if (data.rssi === null) {
+        status.textContent = "Waiting for RSSI...";
+        status.className = "badge ok";
+        reason.textContent = "Sampler is warming up.";
+    } else {
+        status.textContent = "Path is clear";
+        status.className = "badge ok";
+        if (!data.mic_available) {
+            reason.textContent = data.mic_error ? `Mic disabled (${data.mic_error})` : "Mic unavailable";
+        } else {
+            reason.textContent = "Watching Wi‑Fi drops and mic spikes vs baselines.";
+        }
+    }
+}
+
+async function setMode(newMode) {
+    if (!newMode) return;
+    try {
+        const res = await fetch(`/mode?new_mode=${encodeURIComponent(newMode)}`, { method: "POST" });
+        const data = await res.json();
+        if (data.error) return;
+        handleMetricsData({...data, history: chartPoints, mic_history: micChartPoints});
+    } catch (e) {
+        // ignore; UI will resync on next update
+    }
+}
+
+function setModeClick(buttonEl) {
+    const newMode = buttonEl.getAttribute("data-mode");
+    if (!newMode) return;
+    setMode(newMode);
+}
+
+async function updateThreshold() {
+    const input = document.getElementById("threshold-input");
+    if (!input) return;
+    const value = parseInt(input.value, 10);
+    if (Number.isNaN(value)) return;
+    try {
+        await fetch(`/threshold?value=${encodeURIComponent(value)}`, { method: "POST" });
+        threshold = value;
+        document.getElementById("threshold").textContent = threshold;
+    } catch (e) {
+        // ignore errors; UI will reflect correct value on next poll
     }
 }
 
@@ -723,19 +830,61 @@ async function doCalibrate() {
     await update();
 }
 
+async function update() {
+    try {
+        const res = await fetch("/metrics");
+        const data = await res.json();
+        handleMetricsData(data);
+    } catch (e) {
+        const status = document.getElementById("status");
+        status.textContent = "Connection lost";
+        status.className = "badge alert";
+        document.getElementById("reason").textContent = "The UI cannot reach /metrics right now.";
+    }
+}
+
+function connectWebSocket() {
+    const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+    socket = new WebSocket(`${wsProtocol}://${location.host}/ws`);
+
+    socket.onopen = () => {
+        console.log("WebSocket connected");
+    };
+
+    socket.onmessage = (event) => {
+        try {
+            const data = JSON.parse(event.data);
+            handleMetricsData(data);
+        } catch (e) {
+            console.error("Failed to parse WS message", e);
+        }
+    };
+
+    socket.onclose = () => {
+        console.log("WebSocket closed, retrying in 2s...");
+        setTimeout(connectWebSocket, 2000);
+        const status = document.getElementById("status");
+        status.textContent = "Connection lost";
+        status.className = "badge alert";
+    };
+
+    socket.onerror = (err) => {
+        console.error("WebSocket error", err);
+    };
+}
+
 function resizeAll() {
     ensureCanvasSize(wifiCanvas, wifiCtx, wifiSize);
     ensureCanvasSize(micCanvas, micCtx, micSize);
-}
-
-resizeAll();
-update();
-pollHandle = setInterval(update, pollMs);
-window.addEventListener('resize', () => {
-    resizeAll();
     renderSeries(wifiCanvas, wifiCtx, wifiSize, chartPoints, lastBaseline, "rssi", wifiPalette, "Waiting for RSSI samples…");
     renderSeries(micCanvas, micCtx, micSize, micChartPoints, lastMicBaseline, "level", micPalette, "Waiting for mic samples…");
-});
+}
+
+update();
+resizeAll();
+pollHandle = setInterval(update, pollMs);
+connectWebSocket();
+window.addEventListener('resize', resizeAll);
 </script>
 
 </body>

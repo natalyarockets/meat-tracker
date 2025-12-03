@@ -1,0 +1,28 @@
+# Python virtual environments
+myenv/
+.env/
+venv/
+*.venv/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# OS / editor files
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Logs
+*.log
+
+# Local test scripts or artifacts you don't want in the repo
+# (keep test.py if you want it versioned by commenting this out)
+# test.py
