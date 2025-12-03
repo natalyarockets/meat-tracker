@@ -459,6 +459,7 @@ let pollMs = 300;
 let chartPoints = [];
 let lastBaseline = null;
 let socket = null;
+let lastPhotoUrl = null;
 
 const canvas = document.getElementById("chart");
 const ctx = canvas.getContext("2d");
@@ -587,8 +588,9 @@ function handleMetricsData(data) {
     const photoBox = document.getElementById("photoBox");
     if (photoBox) {
         const url = data.photo_url;
-        if (url) {
-            // Replace current image with latest photo
+        // Only update the DOM if the photo URL actually changed
+        if (url && url !== lastPhotoUrl) {
+            lastPhotoUrl = url;
             photoBox.innerHTML = "";
             const img = document.createElement("img");
             img.src = url + `?t=${Date.now()}`; // cache-bust so latest photo loads
